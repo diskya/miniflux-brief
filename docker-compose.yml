@@ -15,9 +15,9 @@ services:
       - feedsum-data:/data
     # Miniflux posts its webhook here, and the reverse proxy mounts this on the
     # Miniflux origin. Loopback only: everything reaching it is already trusted.
-    # Set FEEDSUM_BIND in .env to move it, e.g. 127.0.0.1:9012.
+    # Change the left-hand side if port 8012 is taken.
     ports:
-      - "${FEEDSUM_BIND:-127.0.0.1:8012}:8012"
+      - "127.0.0.1:8012:8012"
     # Lets MINIFLUX_URL reach a Miniflux running on the host itself.
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -302,11 +302,9 @@ async def test_a_restart_resumes_interrupted_entries_without_stampeding(tmp_path
     store.close()
 
 
-def test_retry_delays_are_read_as_a_list(monkeypatch):
-    monkeypatch.delenv("FEEDSUM_TEST_DELAYS", raising=False)
-    assert config_module._seconds("FEEDSUM_TEST_DELAYS", (1, 2)) == (1, 2)
-    monkeypatch.setenv("FEEDSUM_TEST_DELAYS", "30, 60  90")
-    assert config_module._seconds("FEEDSUM_TEST_DELAYS", ()) == (30, 60, 90)
-    # An empty setting is a deliberate "never retry", not a missing one.
-    monkeypatch.setenv("FEEDSUM_TEST_DELAYS", "")
-    assert config_module._seconds("FEEDSUM_TEST_DELAYS", (1, 2)) == ()
+def test_feeds_can_be_restricted_to_an_allowlist(monkeypatch):
+    monkeypatch.setenv("FEEDSUM_TEST_FEEDS", "3, 7  11")
+    assert config_module._ids("FEEDSUM_TEST_FEEDS") == frozenset({3, 7, 11})
+    # Empty means every feed, so a blank setting must not become {0}.
+    monkeypatch.setenv("FEEDSUM_TEST_FEEDS", "")
+    assert config_module._ids("FEEDSUM_TEST_FEEDS") == frozenset()

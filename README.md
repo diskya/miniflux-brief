@@ -110,12 +110,11 @@ Miniflux's **Save** button also fires the webhook and forces a re-run.
 | `FEEDSUM_GEMINI_MODEL` | `gemini-3.7-flash` | must support video input |
 | `FEEDSUM_WRITE_BACK` | `1` | `0` leaves entries alone |
 | `FEEDSUM_FEED_IDS` | all | restrict automatic briefing to these feeds |
-| `FEEDSUM_CONCURRENCY` | `1` | parallel jobs |
-| `FEEDSUM_JOB_TIMEOUT` | `600` | seconds per entry |
-| `FEEDSUM_RETRY_DELAYS` | `120,900,3600` | waits between attempts; empty disables |
-| `FEEDSUM_RESUME_LIMIT` | `20` | pending entries a restart picks up again |
-| `FEEDSUM_MAX_ARTICLE_CHARS` | `200000` | truncation before the text model |
-| `FEEDSUM_READER_URL`, `FEEDSUM_DB`, `FEEDSUM_BIND` | | set by Compose |
+| `FEEDSUM_READER_URL`, `FEEDSUM_DB` | | set by Compose; needed only without it |
+
+That is the whole list. Concurrency, timeouts, retry delays and truncation are
+fixed values at the end of [`feedsum/config.py`](feedsum/config.py), not
+settings — they are safety valves rather than deployment choices.
 
 ## HTTP
 
@@ -159,9 +158,10 @@ valid `X-Miniflux-Signature`.
   first content ever seen is stored and every write rebuilds from that copy.
 - **Several Gemini keys rotate.** On `429`/`5xx` feedsum moves to the next key and
   remembers the one that worked. Keys go in a header, never a query string.
-- **Transient failures retry** on `FEEDSUM_RETRY_DELAYS` and stay amber; refusals
-  and paywalls fail immediately with the reason. A restart resumes what was in
-  flight, up to `FEEDSUM_RESUME_LIMIT`, so a burst cannot stampede providers.
+- **Transient failures retry** after 2 minutes, 15 minutes and an hour, staying
+  amber meanwhile; refusals and paywalls fail immediately with the reason. A
+  restart resumes what was in flight, but caps how much, so a burst cannot
+  stampede the providers.
 - **The reader is swappable**: point `FEEDSUM_READER_URL` at anything answering
   `GET /v1/read?url=…&json=true` with `{"text", "title", "video_url"}`.
 - **Do not bulk-queue a backlog.** ~95 entries at once is enough to exhaust a

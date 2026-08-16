@@ -1,16 +1,16 @@
-"""Configuration, read once from the environment."""
+"""Configuration.
+
+What comes from the environment is what differs between deployments: where your
+Miniflux is, which models to call, what to summarize. Everything below that is a
+fixed value rather than a setting — they are limits and safety valves, not
+decisions worth making per install. They are gathered at the end of `Config`, in
+one place, for anyone who disagrees.
+"""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-
-
-def _int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "") or default)
-    except ValueError:
-        return default
 
 
 def _keys(name: str) -> tuple[str, ...]:
@@ -21,19 +21,6 @@ def _keys(name: str) -> tuple[str, ...]:
     for part in raw.replace(",", " ").split():
         seen.setdefault(part.strip(), None)
     return tuple(seen)
-
-
-def _seconds(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
-    """Read a comma- or whitespace-separated list of delays, in seconds."""
-
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    parts = raw.replace(",", " ").split()
-    try:
-        return tuple(max(0, int(part)) for part in parts)
-    except ValueError:
-        return default
 
 
 def _ids(name: str) -> frozenset[int]:
@@ -71,23 +58,25 @@ class Config:
     # Only these feeds are summarized automatically; empty means every feed.
     feed_allowlist: frozenset[int] = field(default_factory=lambda: _ids("FEEDSUM_FEED_IDS"))
 
-    # One at a time keeps well inside the Gemini free tier's per-minute limits.
-    concurrency: int = field(default_factory=lambda: _int("FEEDSUM_CONCURRENCY", 1))
-    # Long enough for Gemini to watch an hour-long video.
-    job_timeout: int = field(default_factory=lambda: _int("FEEDSUM_JOB_TIMEOUT", 600))
-    max_article_chars: int = field(default_factory=lambda: _int("FEEDSUM_MAX_ARTICLE_CHARS", 200_000))
+    # --- Fixed values. Not environment variables, because no deployment has a
+    # --- reason to differ; edit them here if yours does.
 
+    # One entry at a time keeps well inside free-tier per-minute limits, and
+    # briefs arrive before you read the entry either way.
+    concurrency: int = 1
+    # Long enough for Gemini to watch an hour-long video.
+    job_timeout: int = 600
+    # About 50k tokens. Longer than any article; short enough to bound a bill.
+    max_article_chars: int = 200_000
     # How long to wait before each further attempt at an entry that failed for a
     # reason unrelated to the entry itself. Spread wide, because the common cause
-    # is an exhausted daily quota. Empty disables retrying.
-    retry_delays: tuple[int, ...] = field(
-        default_factory=lambda: _seconds("FEEDSUM_RETRY_DELAYS", (120, 900, 3600))
-    )
+    # is an exhausted daily quota. Empty would disable retrying.
+    retry_delays: tuple[int, ...] = (120, 900, 3600)
     # A restart interrupts whatever was in flight. Those entries are picked up
     # again on the next start, but only this many: the rest are marked failed
     # rather than replayed, so a restart during a large burst cannot stampede
     # the providers. They stay one click away.
-    resume_limit: int = field(default_factory=lambda: _int("FEEDSUM_RESUME_LIMIT", 20))
+    resume_limit: int = 20
 
     def require(self) -> None:
         missing = [
