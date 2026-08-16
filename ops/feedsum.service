@@ -1,0 +1,36 @@
+# Systemd unit for a native install. Adjust User and the two paths, then:
+#   sudo cp ops/feedsum.service /etc/systemd/system/
+#   sudo systemctl enable --now feedsum
+[Unit]
+Description=feedsum - summarizes Miniflux entries on arrival
+Documentation=https://github.com/diskya/miniflux-brief
+After=network-online.target miniflux.service reader.service
+Wants=network-online.target
+Requires=reader.service
+
+[Service]
+Type=exec
+User=feedsum
+Group=feedsum
+WorkingDirectory=/opt/miniflux-brief
+EnvironmentFile=/etc/feedsum.conf
+ExecStart=/opt/miniflux-brief/.venv/bin/python -m uvicorn feedsum.app:app \
+    --host 127.0.0.1 --port 8012 --no-access-log
+Restart=always
+RestartSec=5
+
+# The summaries and the saved original entry content live here.
+StateDirectory=feedsum
+ReadWritePaths=/var/lib/feedsum
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

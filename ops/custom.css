@@ -1,0 +1,107 @@
+/* feedsum - styling for the Brief action and its panel.
+   Lives in Custom CSS because Miniflux's CSP allows only nonced styles, so the
+   custom JS cannot set inline styles or inject a <style> element itself. */
+
+/* Miniflux styles its own action row with `.item-meta-icons li > :is(a, button)`,
+   so the button needs matching specificity to not come out grey like the rest. */
+.item-meta-icons li > .feedsum-button,
+.entry-actions li > .feedsum-button {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 0.8rem;
+    /* Matches the icon actions alongside it. */
+    color: #777;
+    cursor: pointer;
+    text-decoration: none;
+}
+
+.item-meta-icons li > .feedsum-button:hover,
+.item-meta-icons li > .feedsum-button:focus,
+.entry-actions li > .feedsum-button:hover,
+.entry-actions li > .feedsum-button:focus {
+    color: #fff;
+}
+
+.item-meta-icons li > .feedsum-button[disabled],
+.entry-actions li > .feedsum-button[disabled] {
+    cursor: progress;
+    opacity: 0.7;
+}
+
+/* The button is also the status light: a brief already exists, one is being
+   generated right now, or the last attempt failed. */
+.item-meta-icons li > .feedsum-button.is-ready,
+.entry-actions li > .feedsum-button.is-ready {
+    color: #4e8f66;
+}
+
+.item-meta-icons li > .feedsum-button.is-working,
+.entry-actions li > .feedsum-button.is-working {
+    color: #d8b45c;
+}
+
+.item-meta-icons li > .feedsum-button.is-failed,
+.entry-actions li > .feedsum-button.is-failed {
+    color: #ff9c8a;
+}
+
+.feedsum-panel {
+    margin: 0.6em 0 0.2em;
+    padding: 0.6em 0.9em;
+    border-left: 3px solid #7aa7ff;
+    background: rgba(122, 167, 255, 0.06);
+    font-size: 0.95em;
+    line-height: 1.55;
+}
+
+.feedsum-panel h4 {
+    margin: 0.4em 0 0.2em;
+    font-size: 1em;
+}
+
+.feedsum-panel p {
+    margin: 0.4em 0;
+}
+
+.feedsum-panel ol,
+.feedsum-panel ul {
+    margin: 0.3em 0;
+    padding-left: 1.6em;
+}
+
+.feedsum-panel ol {
+    list-style: decimal outside;
+}
+
+.feedsum-panel ul {
+    list-style: square outside;
+}
+
+/* The panel sits inside `.item-meta`, whose `li` rule would otherwise make
+   these inline-block and drop the markers. */
+.feedsum-panel li {
+    display: list-item;
+    margin: 0.3em 0;
+}
+
+.feedsum-panel hr {
+    border: none;
+    border-top: 1px solid #555;
+    margin: 0.7em 0;
+}
+
+.feedsum-status {
+    opacity: 0.75;
+    font-style: italic;
+}
+
+.feedsum-error {
+    color: #ff9c8a;
+}
+
+.feedsum-source {
+    margin-top: 0.6em;
+    font-size: 0.8em;
+    opacity: 0.55;
+}

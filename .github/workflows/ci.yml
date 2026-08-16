@@ -1,0 +1,43 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  feedsum:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest tests/test_feedsum.py -q
+
+  reader:
+    # Its own job: the reader pulls in a browser stack that feedsum never needs.
+    # The tests mock the fetchers, so no browser is installed here.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r reader/requirements.txt -r requirements-dev.txt
+      - run: pytest tests/test_reader.py -q
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Only the feedsum image: building the reader means downloading two
+      # browsers, which is not worth doing on every push.
+      - run: docker build -t miniflux-brief-feedsum .

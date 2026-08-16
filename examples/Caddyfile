@@ -1,0 +1,20 @@
+# Mounting feedsum on the Miniflux origin, for Caddy.
+#
+# Miniflux's Content-Security-Policy is `connect-src 'self'`, so the custom JS
+# that draws the Brief button can only call the origin Miniflux is served from.
+# Putting feedsum under /_summary on that same origin is what makes the button
+# work — and it means whatever authenticates Miniflux authenticates these calls
+# too, so no API token ever has to reach the page.
+
+feeds.example.com {
+    # If you put an authentication layer in front of Miniflux, import it here,
+    # before the handlers, so it covers both.
+    # import authed
+
+    handle /_summary/* {
+        uri strip_prefix /_summary
+        reverse_proxy 127.0.0.1:8012
+    }
+
+    reverse_proxy 127.0.0.1:8080
+}

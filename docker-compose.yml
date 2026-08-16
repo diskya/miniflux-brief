@@ -1,0 +1,49 @@
+# feedsum and the reader. Miniflux itself is not here: this is an addition to a
+# Miniflux you already run. Point MINIFLUX_URL at it in .env — see that file for
+# the three usual cases (same host, another Compose project, another machine).
+
+services:
+  feedsum:
+    build: .
+    image: miniflux-brief-feedsum
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      FEEDSUM_READER_URL: http://reader:8010
+      FEEDSUM_DB: /data/feedsum.db
+    volumes:
+      - feedsum-data:/data
+    # Miniflux posts its webhook here, and the reverse proxy mounts this on the
+    # Miniflux origin. Loopback only: everything reaching it is already trusted.
+    # Set FEEDSUM_BIND in .env to move it, e.g. 127.0.0.1:9012.
+    ports:
+      - "${FEEDSUM_BIND:-127.0.0.1:8012}:8012"
+    # Lets MINIFLUX_URL reach a Miniflux running on the host itself.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - brief
+    depends_on:
+      - reader
+
+  reader:
+    build:
+      context: .
+      dockerfile: reader/Dockerfile
+    image: miniflux-brief-reader
+    restart: unless-stopped
+    # This service fetches whatever a feed points at, with a real browser for
+    # the harder pages. It refuses private addresses itself, but that check is
+    # only a second line of defence if the browser has nowhere private to go:
+    # it shares a network with feedsum and nothing else, reaches neither
+    # Miniflux nor the host, and publishes no port of its own.
+    networks:
+      - brief
+    # Chromium wants more than the default 64MB of shared memory.
+    shm_size: 512mb
+
+networks:
+  brief:
+
+volumes:
+  feedsum-data:

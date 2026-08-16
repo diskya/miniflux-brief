@@ -1,0 +1,25 @@
+# Systemd unit for a native install of the reader. Adjust User and the paths.
+# The browser tiers need a writable HOME for their caches, so this deliberately
+# keeps a permissive filesystem — in Docker that is handled by isolation instead.
+[Unit]
+Description=Article Reader - URL to clean article Markdown
+Documentation=https://github.com/diskya/miniflux-brief
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=reader
+Group=reader
+WorkingDirectory=/opt/miniflux-brief
+Environment=HOME=/home/reader
+ExecStart=/opt/miniflux-brief/.venv/bin/python -m uvicorn reader.app:app \
+    --host 127.0.0.1 --port 8010 --no-access-log
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
