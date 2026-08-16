@@ -10,7 +10,12 @@ from feedsum import config as config_module
 from feedsum import summarize
 from feedsum.render import markdown_to_html
 from feedsum.store import ERROR, PENDING, READY, Store
-from feedsum.summarize import SummarizeError, _reject_if_unusable, youtube_id
+from feedsum.summarize import (
+    SummarizeError,
+    _reject_if_unusable,
+    _validate_brief_shape,
+    youtube_id,
+)
 
 
 @pytest.mark.parametrize(
@@ -51,11 +56,13 @@ class FakeClient:
     def __init__(self, statuses: list[int]) -> None:
         self.statuses = statuses
         self.keys_tried: list[str] = []
+        self.payloads: list[dict] = []
 
     async def post(self, _endpoint, headers=None, json=None, params=None):
         # The key must arrive as a header; a query string would leak it to logs.
         assert params is None, "the API key must not be put in the query string"
         self.keys_tried.append((headers or {})["x-goog-api-key"])
+        self.payloads.append(json)
         return FakeResponse(self.statuses[len(self.keys_tried) - 1])
 
 
@@ -68,6 +75,9 @@ async def test_an_exhausted_key_falls_through_to_the_next(monkeypatch):
 
     assert response.status_code == 200
     assert client.keys_tried == ["key-a", "key-b", "key-c"]
+    assert client.payloads[0]["generationConfig"]["maxOutputTokens"] == (
+        summarize.config.max_summary_tokens
+    )
 
 
 @pytest.mark.asyncio
@@ -172,6 +182,44 @@ def test_a_refusal_without_a_reason_still_reads_sensibly():
     assert "did not contain the actual content" in str(caught.value)
 
 
+def test_brief_shape_is_validated_before_rendering():
+    valid = "1. One\n2. Two\n3. Three\n\n---\n\n## Good\nYes.\n\n## Gap\nNo."
+    assert _validate_brief_shape(valid) == valid
+    for malformed in (
+        "1. Only one\n\n---\n\n## Good\nYes.\n\n## Gap\nNo.",
+        "1. One\n2. Two\n3. Three\n\n## Good\nYes.\n\n## Gap\nNo.",
+        "1. One\n2. Two\n3. Three\n\n---\n\n## Empty\n\n## Gap\nNo.",
+    ):
+        with pytest.raises(SummarizeError, match="malformed brief"):
+            _validate_brief_shape(malformed)
+
+
+def test_all_non_gemini_credentials_fail_fast():
+    complete = replace(
+        app_module.config,
+        miniflux_url="http://miniflux",
+        miniflux_token="miniflux-token",
+        webhook_secret="webhook-secret",
+        ui_token="ui-token",
+        openai_base="http://provider/v1",
+        openai_key="provider-token",
+        text_model="model",
+        gemini_keys=(),
+    )
+    complete.require()
+    for field, setting in (
+        ("miniflux_url", "MINIFLUX_URL"),
+        ("miniflux_token", "MINIFLUX_API_TOKEN"),
+        ("webhook_secret", "FEEDSUM_WEBHOOK_SECRET"),
+        ("ui_token", "FEEDSUM_UI_TOKEN"),
+        ("openai_base", "OPENAI_API_BASE"),
+        ("openai_key", "OPENAI_API_KEY"),
+        ("text_model", "FEEDSUM_TEXT_MODEL"),
+    ):
+        with pytest.raises(RuntimeError, match=setting):
+            replace(complete, **{field: ""}).require()
+
+
 def test_render_covers_the_shape_the_prompt_asks_for():
     html = markdown_to_html("1. First **claim**\n2. Second claim\n\n---\n\nA short critique.")
     assert html == (
@@ -255,14 +303,16 @@ async def test_a_transient_failure_is_retried_before_it_is_given_up_on(tmp_path,
     queue: asyncio.Queue = asyncio.Queue()
     store.claim(5, "https://example.com/a")
 
-    app_module._fail(store, queue, 5, "https://example.com/a", "Quota gone.", retryable=True, attempt=1)
+    generation = store.get(5).generation
+    item = app_module.WorkItem("summary", 5, "https://example.com/a", generation)
+    app_module._fail_summary(store, queue, item, "Quota gone.", retryable=True, attempt=1)
     await asyncio.gather(*app_module._retries)
 
-    assert queue.get_nowait() == (5, "https://example.com/a")
+    assert queue.get_nowait() == item
     # An entry waiting to be retried is still in progress, not a red button.
     assert store.get(5).status == PENDING
 
-    app_module._fail(store, queue, 5, "https://example.com/a", "Quota gone.", retryable=True, attempt=2)
+    app_module._fail_summary(store, queue, item, "Quota gone.", retryable=True, attempt=2)
 
     assert queue.empty()
     assert (store.get(5).status, store.get(5).error) == (ERROR, "Quota gone.")
@@ -275,7 +325,9 @@ async def test_a_permanent_failure_is_not_retried(tmp_path):
     queue: asyncio.Queue = asyncio.Queue()
     store.claim(6, "https://example.com/a")
 
-    app_module._fail(store, queue, 6, "https://example.com/a", "Paywalled.", retryable=False, attempt=1)
+    generation = store.get(6).generation
+    item = app_module.WorkItem("summary", 6, "https://example.com/a", generation)
+    app_module._fail_summary(store, queue, item, "Paywalled.", retryable=False, attempt=1)
 
     assert queue.empty()
     assert store.get(6).status == ERROR
@@ -308,3 +360,7 @@ def test_feeds_can_be_restricted_to_an_allowlist(monkeypatch):
     # Empty means every feed, so a blank setting must not become {0}.
     monkeypatch.setenv("FEEDSUM_TEST_FEEDS", "")
     assert config_module._ids("FEEDSUM_TEST_FEEDS") == frozenset()
+    for invalid in ("0", "-3", "3,nope"):
+        monkeypatch.setenv("FEEDSUM_TEST_FEEDS", invalid)
+        with pytest.raises(ValueError, match="positive integer"):
+            config_module._ids("FEEDSUM_TEST_FEEDS")

@@ -17,11 +17,13 @@ import httpx
 
 from .config import config
 
-
 logger = logging.getLogger("feedsum.summarize")
 
 
 UNUSABLE_PREFIX = "UNUSABLE:"
+_NUMBERED_TAKEAWAY = re.compile(r"^\s*\d+[.)]\s+\S")
+_SECTION_HEADING = re.compile(r"^\s*##\s+\S")
+_MARKDOWN_RULE = re.compile(r"^\s*([-*_])(?:\s*\1){2,}\s*$")
 
 TASK = (
     "Produce a compact brief for someone triaging their reading list.\n"
@@ -72,8 +74,40 @@ def _reject_if_unusable(text: str) -> str:
 
     if not text.upper().startswith(UNUSABLE_PREFIX):
         return text
-    reason = text[len(UNUSABLE_PREFIX):].strip().rstrip(".")
+    reason = text[len(UNUSABLE_PREFIX) :].strip().rstrip(".")
     raise SummarizeError(f"No brief — {reason or 'the page did not contain the actual content'}.")
+
+
+def _validate_brief_shape(text: str) -> str:
+    """Reject malformed model output before it reaches storage or Miniflux."""
+
+    cleaned = _reject_if_unusable(text.strip())
+    lines = cleaned.splitlines()
+    try:
+        rule_index = next(index for index, line in enumerate(lines) if _MARKDOWN_RULE.match(line))
+    except StopIteration as exc:
+        raise SummarizeError(
+            "The summarizer returned a malformed brief (missing sections)."
+        ) from exc
+    takeaways = sum(bool(_NUMBERED_TAKEAWAY.match(line)) for line in lines[:rule_index])
+    headings = [
+        index
+        for index, line in enumerate(lines[rule_index + 1 :], rule_index + 1)
+        if _SECTION_HEADING.match(line)
+    ]
+    if not 3 <= takeaways <= 5 or len(headings) != 2:
+        raise SummarizeError("The summarizer returned a malformed brief (unexpected shape).")
+    if any(
+        not any(
+            line.strip()
+            for line in lines[
+                index + 1 : headings[position + 1] if position + 1 < len(headings) else None
+            ]
+        )
+        for position, index in enumerate(headings)
+    ):
+        raise SummarizeError("The summarizer returned a malformed brief (empty section).")
+    return cleaned
 
 
 @dataclass(slots=True)
@@ -136,12 +170,11 @@ async def _gemini_generate(client: httpx.AsyncClient, video_id: str) -> httpx.Re
     keys = config.gemini_keys
     if not keys:
         return None
-    endpoint = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/{config.gemini_model}:generateContent"
-    )
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{config.gemini_model}:generateContent"
     watch_url = f"https://www.youtube.com/watch?v={video_id}"
     payload = {
-        "contents": [{"parts": [{"file_data": {"file_uri": watch_url}}, {"text": TASK}]}]
+        "contents": [{"parts": [{"file_data": {"file_uri": watch_url}}, {"text": TASK}]}],
+        "generationConfig": {"maxOutputTokens": config.max_summary_tokens},
     }
 
     last: httpx.Response | None = None
@@ -165,8 +198,12 @@ async def _gemini_generate(client: httpx.AsyncClient, video_id: str) -> httpx.Re
             last = response
             if response.status_code not in _RETRYABLE_STATUSES:
                 return response
-            logger.warning("gemini key %d of %d unavailable (HTTP %s)", index + 1, len(keys),
-                           response.status_code)
+            logger.warning(
+                "gemini key %d of %d unavailable (HTTP %s)",
+                index + 1,
+                len(keys),
+                response.status_code,
+            )
     return last
 
 
@@ -183,12 +220,14 @@ async def _summarize_youtube(client: httpx.AsyncClient, url: str, video_id: str)
     if not candidates:
         # A refusal or a video Gemini could not open arrives with no candidate.
         blocked = (body.get("promptFeedback") or {}).get("blockReason")
-        raise SummarizeError(f"Gemini returned no summary for the video ({blocked or 'no candidates'}).")
+        raise SummarizeError(
+            f"Gemini returned no summary for the video ({blocked or 'no candidates'})."
+        )
     parts = (candidates[0].get("content") or {}).get("parts") or []
     text = "".join(part.get("text", "") for part in parts).strip()
     if not text:
         raise SummarizeError("Gemini returned an empty summary for the video.")
-    return Brief(markdown=_reject_if_unusable(text), source="youtube", model=config.gemini_model)
+    return Brief(markdown=_validate_brief_shape(text), source="youtube", model=config.gemini_model)
 
 
 def _gemini_error(response: httpx.Response | None) -> str:
@@ -247,9 +286,13 @@ async def _summarize_article(client: httpx.AsyncClient, url: str) -> Brief:
         headers={"Authorization": f"Bearer {config.openai_key}"},
         json={
             "model": config.text_model,
+            "max_tokens": config.max_summary_tokens,
             "messages": [
                 {"role": "system", "content": TASK},
-                {"role": "user", "content": f"Title: {title or 'Unknown'}\nURL: {url}\n\n{article}"},
+                {
+                    "role": "user",
+                    "content": f"Title: {title or 'Unknown'}\nURL: {url}\n\n{article}",
+                },
             ],
         },
     )
@@ -263,7 +306,7 @@ async def _summarize_article(client: httpx.AsyncClient, url: str) -> Brief:
     if not text:
         raise SummarizeError("The summarizer returned an empty response.")
     return Brief(
-        markdown=_reject_if_unusable(text), source="article", model=config.text_model, title=title
+        markdown=_validate_brief_shape(text), source="article", model=config.text_model, title=title
     )
 
 

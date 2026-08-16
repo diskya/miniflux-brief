@@ -10,7 +10,6 @@ from __future__ import annotations
 import html
 import re
 
-
 _BOLD = re.compile(r"\*\*(.+?)\*\*", re.S)
 _ITALIC = re.compile(r"(?<![\w*])[*_](?!\s)(.+?)(?<!\s)[*_](?![\w*])", re.S)
 _CODE = re.compile(r"`([^`]+)`")

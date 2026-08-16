@@ -3,12 +3,13 @@
 # Miniflux's Content-Security-Policy is `connect-src 'self'`, so the custom JS
 # that draws the Brief button can only call the origin Miniflux is served from.
 # Putting feedsum under /_summary on that same origin is what makes the button
-# work — and it means whatever authenticates Miniflux authenticates these calls
-# too, so no API token ever has to reach the page.
+# work. A Miniflux session cookie does not authenticate a different upstream;
+# feedsum therefore also requires X-Feedsum-UI-Token on every /v1 request.
 
 feeds.example.com {
-    # If you put an authentication layer in front of Miniflux, import it here,
-    # before the handlers, so it covers both.
+    # If you also put a proxy authentication layer in front of Miniflux, import
+    # it before both handlers. It is defense in depth, not a replacement for
+    # the feedsum UI token.
     # import authed
 
     handle /_summary/* {

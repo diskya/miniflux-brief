@@ -30,6 +30,8 @@ def article_html(marker: str = "normal") -> str:
 
 @pytest.fixture(autouse=True)
 def public_urls(monkeypatch):
+    monkeypatch.setenv("READER_ALLOW_DIRECT", "1")
+
     async def accept(url: str) -> str:
         return url
 
@@ -128,7 +130,9 @@ async def test_non_cloudflare_challenge_skips_cloudflare_solver(monkeypatch, ext
 
 @pytest.mark.asyncio
 async def test_plain_404_fails_without_browser(monkeypatch, extraction):
-    monkeypatch.setattr(reader, "_static_once", AsyncMock(return_value=FakePage("<html></html>", status=404)))
+    monkeypatch.setattr(
+        reader, "_static_once", AsyncMock(return_value=FakePage("<html></html>", status=404))
+    )
     stealth = AsyncMock()
     dynamic = AsyncMock()
     monkeypatch.setattr(reader, "_stealth_once", stealth)
@@ -236,7 +240,9 @@ async def test_non_html_is_unsupported_without_dynamic(monkeypatch, extraction):
 
 @pytest.mark.asyncio
 async def test_5xx_retries_same_tier(monkeypatch, extraction):
-    static = AsyncMock(side_effect=[FakePage("<html></html>", status=503), FakePage(article_html("normal"))])
+    static = AsyncMock(
+        side_effect=[FakePage("<html></html>", status=503), FakePage(article_html("normal"))]
+    )
     monkeypatch.setattr(reader, "_static_once", static)
 
     result = await reader.read_article("https://example.com/recovered")
@@ -266,7 +272,12 @@ async def test_repeated_5xx_does_not_escalate_to_stealth(monkeypatch, extraction
 
 @pytest.mark.parametrize(
     "url",
-    ["file:///etc/passwd", "http://localhost/x", "http://127.0.0.1/x", "http://169.254.169.254/latest/meta-data"],
+    [
+        "file:///etc/passwd",
+        "http://localhost/x",
+        "http://127.0.0.1/x",
+        "http://169.254.169.254/latest/meta-data",
+    ],
 )
 @pytest.mark.asyncio
 async def test_url_safeguards_reject_non_public_targets(monkeypatch, url):
@@ -292,7 +303,9 @@ def ld_json(payload: str) -> str:
 
 
 def test_video_object_identifies_the_page_as_a_video():
-    html = ld_json('{"@type": "VideoObject", "embedUrl": "https://www.youtube.com/embed/iNyUmbmQQZg"}')
+    html = ld_json(
+        '{"@type": "VideoObject", "embedUrl": "https://www.youtube.com/embed/iNyUmbmQQZg"}'
+    )
     assert reader.find_primary_video(html) == "https://www.youtube.com/watch?v=iNyUmbmQQZg"
 
 
@@ -307,14 +320,19 @@ def test_video_object_is_found_inside_a_graph():
 def test_an_illustrative_embed_is_not_a_video_page():
     # An essay that merely embeds a clip must keep being read as an article.
     html = (
-        '<html><body><article>Essay text</article>'
+        "<html><body><article>Essay text</article>"
         '<iframe src="https://www.youtube.com/embed/iNyUmbmQQZg"></iframe></body></html>'
     )
     assert reader.find_primary_video(html) is None
 
 
 def test_non_youtube_and_malformed_video_metadata_are_ignored():
-    assert reader.find_primary_video(ld_json('{"@type": "VideoObject", "embedUrl": "https://vimeo.com/123"}')) is None
+    assert (
+        reader.find_primary_video(
+            ld_json('{"@type": "VideoObject", "embedUrl": "https://vimeo.com/123"}')
+        )
+        is None
+    )
     assert reader.find_primary_video(ld_json("{not json at all}")) is None
     assert reader.find_primary_video("<html><body>no metadata</body></html>") is None
 
@@ -323,7 +341,9 @@ def test_non_youtube_and_malformed_video_metadata_are_ignored():
 async def test_video_url_is_reported_on_the_result(monkeypatch, extraction):
     page = FakePage(
         article_html("normal")
-        + ld_json('{"@type": "VideoObject", "embedUrl": "https://www.youtube.com/embed/iNyUmbmQQZg"}')
+        + ld_json(
+            '{"@type": "VideoObject", "embedUrl": "https://www.youtube.com/embed/iNyUmbmQQZg"}'
+        )
     )
     monkeypatch.setattr(reader, "_static_once", AsyncMock(return_value=page))
 
@@ -390,6 +410,7 @@ async def test_api_rate_limit_error_includes_retry_after(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_scrapling_calls_use_one_internal_attempt(monkeypatch):
+    monkeypatch.setenv("READER_OUTBOUND_PROXY", "http://proxy.test:3128")
     page = FakePage("<html></html>")
     static = AsyncMock(return_value=page)
     dynamic = AsyncMock(return_value=page)
@@ -404,13 +425,39 @@ async def test_scrapling_calls_use_one_internal_attempt(monkeypatch):
 
     assert static.await_args.kwargs["retries"] == 1
     assert static.await_args.kwargs["follow_redirects"] is False
+    assert static.await_args.kwargs["proxy"] == "http://proxy.test:3128"
     assert dynamic.await_args.kwargs["retries"] == 1
+    assert dynamic.await_args.kwargs["proxy"] == "http://proxy.test:3128"
+    assert "--disable-quic" in dynamic.await_args.kwargs["extra_flags"]
+    assert (
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
+        in dynamic.await_args.kwargs["extra_flags"]
+    )
     assert stealth.await_args.kwargs["retries"] == 1
+    assert stealth.await_args.kwargs["proxy"] == "http://proxy.test:3128"
     assert stealth.await_args.kwargs["solve_cloudflare"] is True
+    assert stealth.await_args.kwargs["block_webrtc"] is True
     if reader.SYSTEM_CHROME_PATH:
         assert dynamic.await_args.kwargs["real_chrome"] is True
         assert dynamic.await_args.kwargs["executable_path"] == reader.SYSTEM_CHROME_PATH
         assert stealth.await_args.kwargs["real_chrome"] is True
+
+
+@pytest.mark.asyncio
+async def test_reader_fails_closed_without_proxy_or_explicit_direct_mode(monkeypatch):
+    monkeypatch.delenv("READER_OUTBOUND_PROXY", raising=False)
+    monkeypatch.delenv("READER_ALLOW_DIRECT", raising=False)
+    with pytest.raises(reader.ReaderError) as caught:
+        await reader._static_once("https://example.com")
+    assert caught.value.code == "proxy_required"
+
+
+@pytest.mark.parametrize("value", ["socks5://proxy:1080", "not a url", "http:///missing"])
+def test_invalid_proxy_configuration_is_rejected(monkeypatch, value):
+    monkeypatch.setenv("READER_OUTBOUND_PROXY", value)
+    with pytest.raises(reader.ReaderError) as caught:
+        reader._proxy_options()
+    assert caught.value.code == "proxy_configuration"
 
 
 @pytest.mark.asyncio

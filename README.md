@@ -1,201 +1,197 @@
 # miniflux-brief
 
-Every new Miniflux entry is summarized on arrival and the summary is written into
-the entry itself, so the unread list *is* the digest. A **Brief** button in the
-Miniflux UI does the same on demand, for older entries and re-runs.
+`miniflux-brief` turns new Miniflux entries into short, useful briefs. It adds
+the brief to the entry itself, so you can scan your unread list without opening
+every article.
 
-```text
-Miniflux ──webhook──▶ feedsum ──▶ queue ──▶ summarize ──▶ write back into the entry
-   ▲                     ▲                      │
-   └── Brief button ─────┘                      ├─ YouTube ──▶ Gemini watches the video
-                                                └─ else ────▶ reader extracts text ──▶ your text model
-```
+![A generated brief displayed in the Miniflux unread list](miniflux-brief.png)
 
-Each brief is 3–5 concrete takeaways, then **Strengths**, then **Critique**, in
-the language of the source.
+Each brief contains:
 
-- **Routing follows the content, not the URL.** A page that is really a wrapper
-  around a video declares a schema.org `VideoObject`; the video gets summarized,
-  not the page's navigation rails.
-- **The button is a status light** — one request per page says which entries have
-  a brief, which are running, which failed.
-- **Re-running never stacks up.** The original entry content is kept, and every
-  write rebuilds from it.
-- **A model that was not given the article says so** instead of inventing one.
+- 3–5 key takeaways
+- strengths
+- a short critique
 
-## What you need
+Articles use any OpenAI-compatible text model. YouTube videos can optionally be
+sent directly to Gemini.
 
-Miniflux, an OpenAI-compatible endpoint (a provider, or Ollama), and Docker or
-Python 3.11+. A Gemini key is optional — without one, only YouTube entries fail.
+## What it does
 
-## Quick start
+- Summarizes new entries from a Miniflux webhook.
+- Adds an optional **Brief** button for older entries and manual re-runs.
+- Preserves the original entry and avoids duplicating briefs.
+- Retries temporary model and Miniflux failures safely.
+- Keeps article fetching in a restricted container with private-network access
+  blocked.
+
+## Requirements
+
+- An existing Miniflux installation
+- Docker Engine with Docker Compose v2
+- An OpenAI-compatible API endpoint, key, and model name
+- Optional: a Gemini API key for YouTube videos
+
+## Install
+
+If you are replacing an existing systemd installation, do **not** start here.
+Follow the [migration guide](docs/MIGRATION.md) so the old writer and SQLite
+database are backed up and cut over safely.
+
+For a new installation:
 
 ```bash
-git clone https://github.com/diskya/miniflux-brief
+git clone https://github.com/diskya/miniflux-brief.git
 cd miniflux-brief
-cp .env.example .env      # every variable is explained in the file
-$EDITOR .env              # MINIFLUX_URL, a token, a secret, an LLM endpoint
-docker compose up -d
+cp .env.example .env
+chmod 600 .env
 ```
 
-This starts **feedsum** (the summarizer, ~200 MB) and the **reader** (URL to
-clean article text, ~2.4 GB — it carries two Chromium builds for pages that will
-not give up their text to a plain fetch).
+Generate two different secrets:
 
-Then in Miniflux:
-
-1. **Settings → API Keys** → create one, put it in `MINIFLUX_API_TOKEN`.
-2. **Settings → Integrations → Webhook** → `http://127.0.0.1:8012/webhook` and
-   the same secret as `FEEDSUM_WEBHOOK_SECRET`. A private URL also needs
-   `INTEGRATION_ALLOW_PRIVATE_NETWORKS=1` in the Miniflux config — that is scoped
-   to integrations, so feed fetching keeps its SSRF protection.
-3. Optional, for the button: paste `ops/custom.js` into **Settings → Custom
-   JavaScript** and `ops/custom.css` into **Settings → Custom CSS**. By hand —
-   the Miniflux API has no field for custom JS. Re-paste after editing either
-   file, or let `ops/apply-assets.py` write both to the database for you (it
-   keeps any CSS of your own).
-
-If Miniflux runs in its own Compose project, join its network rather than routing
-through the host:
-
-```yaml
-# docker-compose.override.yml
-services:
-  feedsum:
-    networks: [brief, miniflux_default]
-networks:
-  miniflux_default: { external: true }
+```bash
+openssl rand -hex 32  # FEEDSUM_WEBHOOK_SECRET
+openssl rand -hex 32  # FEEDSUM_UI_TOKEN
 ```
 
-### The Brief button needs a reverse proxy
+In Miniflux, open **Settings → API Keys** and create a key for feedsum. Then edit
+`.env` and fill in that key, your Miniflux URL, both generated secrets, and your
+model settings. Every option is explained in [.env.example](.env.example).
 
-Miniflux's CSP is `connect-src 'self'`, so its custom JS can only call the
-Miniflux origin. Whatever proxy already fronts Miniflux must therefore strip one
-prefix and forward it to feedsum:
+Apply the reader isolation rules, then start the stack:
+
+```bash
+sudo ops/reader-firewall.sh --apply
+sudo ops/reader-firewall.sh --check
+docker compose up -d --wait
+curl --fail http://127.0.0.1:8012/healthz
+```
+
+The stack contains the summarizer, article reader, API gateway, and restricted
+egress proxy. Miniflux itself is not included.
+
+## Connect Miniflux
+
+### 1. Add the webhook
+
+Open **Settings → Integrations → Webhook** and enter:
+
+- URL: `http://127.0.0.1:8012/webhook` when Miniflux runs directly on the same
+  host
+- Secret: the value of `FEEDSUM_WEBHOOK_SECRET`
+
+Containerized Miniflux must reach feedsum through a shared Docker network or the
+Docker host gateway. See the [migration guide](docs/MIGRATION.md#1-preflight-without-changing-anything)
+for the supported URL choices. Private webhook URLs may require
+`INTEGRATION_ALLOW_PRIVATE_NETWORKS=1` in Miniflux.
+
+### 2. Optional: add the Brief button
+
+Paste [ops/custom.js](ops/custom.js) into **Settings → Custom JavaScript** and
+[ops/custom.css](ops/custom.css) into **Settings → Custom CSS**. The browser asks
+for `FEEDSUM_UI_TOKEN` once per session; no secret is stored in this repository.
+
+Miniflux only allows the script to call its own origin, so your existing reverse
+proxy must forward `/_summary/` to feedsum. For Caddy:
 
 ```caddyfile
 feeds.example.com {
-    handle /_summary/* { uri strip_prefix /_summary; reverse_proxy 127.0.0.1:8012 }
+    handle /_summary/* {
+        uri strip_prefix /_summary
+        reverse_proxy 127.0.0.1:8012
+    }
     reverse_proxy 127.0.0.1:8080
 }
 ```
 
-An nginx version is in [`examples/`](examples/); any proxy expresses the same two
-rules. Whatever authenticates Miniflux now authenticates these calls too, and no
-API token reaches the page.
+An [nginx example](examples/nginx.conf) is also included. Keep the endpoint on
+the same origin as Miniflux and do not enable permissive CORS. A Miniflux login
+cookie does not protect feedsum; all Brief API requests require the separate UI
+token.
 
-**Optional.** It buys the button. Without a proxy the webhook still runs and the
-briefs still land in the entries.
+The button colors show the current state:
 
 | Button | Meaning |
 | --- | --- |
-| `Brief` grey | none yet — clicking generates one (60–100s) |
-| `Brief …` amber | being generated, or waiting on a retry |
-| `Brief` green | ready — opens instantly |
-| `Brief !` red | failed; click to see why |
+| Grey | Not summarized yet |
+| Amber | Working or waiting to retry |
+| Green | Brief is ready |
+| Red | Brief failed; click to see the reason |
 
-Miniflux's **Save** button also fires the webhook and forces a re-run.
+## Essential configuration
 
-## Configuration
-
-| Variable | Default | Notes |
-| --- | --- | --- |
-| `MINIFLUX_URL` | `http://127.0.0.1:8080` | write-back + URL lookup |
-| `MINIFLUX_API_TOKEN` | — | **required** |
-| `FEEDSUM_WEBHOOK_SECRET` | — | must match the Miniflux integration |
-| `OPENAI_API_BASE` | — | **required**; any OpenAI-compatible endpoint |
-| `OPENAI_API_KEY` | — | **required** |
-| `FEEDSUM_TEXT_MODEL` | — | **required**; summarizes articles |
-| `GEMINI_API_KEY` | — | optional, **comma-separated list**; a quota each |
-| `FEEDSUM_GEMINI_MODEL` | `gemini-3.7-flash` | must support video input |
-| `FEEDSUM_WRITE_BACK` | `1` | `0` leaves entries alone |
-| `FEEDSUM_FEED_IDS` | all | restrict automatic briefing to these feeds |
-| `FEEDSUM_READER_URL`, `FEEDSUM_DB` | | set by Compose; needed only without it |
-
-That is the whole list. Concurrency, timeouts, retry delays and truncation are
-fixed values at the end of [`feedsum/config.py`](feedsum/config.py), not
-settings — they are safety valves rather than deployment choices.
-
-## HTTP
-
-| Route | Purpose |
+| Variable | Purpose |
 | --- | --- |
-| `GET /healthz` | liveness |
-| `POST /v1/summaries` | `{"entry_id": 586, "force": false}` — queue one entry |
-| `GET /v1/summaries/{id}` | poll for the result |
-| `POST /v1/summaries/status` | `{"entry_ids":[…]}` — status for a whole page |
-| `POST /webhook` | Miniflux `new_entries` / `save_entry` |
+| `MINIFLUX_URL` | Miniflux address reachable from the feedsum container |
+| `MINIFLUX_API_TOKEN` | Reads entries and writes briefs back |
+| `FEEDSUM_WEBHOOK_SECRET` | Verifies Miniflux webhook signatures |
+| `FEEDSUM_UI_TOKEN` | Protects the optional Brief API and button |
+| `OPENAI_API_BASE` | OpenAI-compatible `/v1` endpoint |
+| `OPENAI_API_KEY` | API credential; use any non-empty value for local Ollama |
+| `FEEDSUM_TEXT_MODEL` | Model used for articles |
+| `GEMINI_API_KEY` | Optional, comma-separated keys for YouTube videos |
+| `FEEDSUM_FEED_IDS` | Optional feed-ID allowlist for automatic briefs |
+| `FEEDSUM_WRITE_BACK` | Set to `0` to keep briefs out of entry content |
 
-Nothing runs inline: a request records a pending row and queues a job. Entry URLs
-are read back from Miniflux by id, never taken from the caller. Webhooks need a
-valid `X-Miniflux-Signature`.
-
-## Why these pieces
-
-- **No fork, no plugin.** Miniflux has none; a webhook, an API that rewrites an
-  entry, and Custom JS are enough.
-- **Two services**, because fetching is the hostile half: the reader is the only
-  thing touching untrusted sites, so it gets its own container and a network with
-  nowhere private to go.
-- **Scrapling fetches, trafilatura extracts.** Scrapling solves acquisition
-  (HTTP → browser → stealth). Its Markdown output is everything inside `<body>`,
-  navigation and "Up next" rails included — exactly what an LLM must not be fed,
-  because it will summarize it. Trafilatura decides which part of the DOM is the
-  article; `favor_precision` drops the rails.
-- **Cheap path first.** A static fetch answers in ~400 ms; a browser costs
-  seconds. The reader escalates only when extraction comes back too thin, or the
-  page was a challenge.
-- **Gemini watches YouTube directly**, which deletes a whole transcript pipeline.
-  Articles are text in, text out, so that half stays provider-neutral.
-- **SQLite, no broker.** A few minute-long jobs a day do not need Celery, and the
-  database has to exist anyway to hold the original entry content.
-- **A 60-line Markdown renderer**, not a parser: the output shape is known, and
-  escaping everything first keeps model output from becoming markup.
-
-## Behaviour worth knowing
-
-- **Write-back is idempotent.** Miniflux strips markers from HTML, so instead the
-  first content ever seen is stored and every write rebuilds from that copy.
-- **Several Gemini keys rotate.** On `429`/`5xx` feedsum moves to the next key and
-  remembers the one that worked. Keys go in a header, never a query string.
-- **Transient failures retry** after 2 minutes, 15 minutes and an hour, staying
-  amber meanwhile; refusals and paywalls fail immediately with the reason. A
-  restart resumes what was in flight, but caps how much, so a burst cannot
-  stampede the providers.
-- **The reader is swappable**: point `FEEDSUM_READER_URL` at anything answering
-  `GET /v1/read?url=…&json=true` with `{"text", "title", "video_url"}`.
-- **Do not bulk-queue a backlog.** ~95 entries at once is enough to exhaust a
-  Gemini daily quota and get you throttled by the source sites.
-
-## Without Docker
+## Everyday commands
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt          # feedsum
-.venv/bin/pip install -r reader/requirements.txt   # the reader
-sudo .venv/bin/playwright install-deps chromium
-.venv/bin/scrapling install && .venv/bin/patchright install chromium
-
-.venv/bin/python -m uvicorn feedsum.app:app --host 127.0.0.1 --port 8012
-.venv/bin/python -m uvicorn reader.app:app  --host 127.0.0.1 --port 8010
+docker compose ps                 # check service health
+docker compose logs -f feedsum    # follow summarizer logs
+docker compose restart feedsum    # restart only the summarizer
+docker compose down               # stop the stack; keeps the data volume
 ```
 
-Both browsers are needed: Scrapling drives the dynamic tier with Playwright and
-the stealth tier with Patchright. `ops/` has systemd units for both services.
+After stopping the complete stack, remove its host firewall rules with:
+
+```bash
+sudo ops/reader-firewall.sh --remove
+```
+
+To update:
+
+```bash
+git pull --ff-only
+docker compose build --pull
+docker compose up -d --wait
+sudo ops/reader-firewall.sh --check
+```
+
+## Security and data
+
+Summaries, job state, and saved original entry content are stored in the
+`feedsum-data` Docker volume. `docker compose down` keeps this volume; do not use
+`docker compose down -v` unless you intend to delete that data.
+
+The reader intentionally fails closed without its filtering proxy and host
+firewall rules. Read [SECURITY.md](SECURITY.md) before changing its networks,
+proxy, fixed addresses, or browser settings.
 
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt -r reader/requirements.txt
-pytest        # 60 tests, no network or browser needed
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt -r reader/requirements.txt
+.venv/bin/pytest -q
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
 ```
 
-## Known gaps
+The full isolated container and egress test is:
 
-- Video summarizing is **YouTube-only**, since it works by handing Gemini a watch
-  URL. Pages without a schema.org `VideoObject` fall back to the article path and
-  refuse rather than fabricate.
-- Briefs are only as good as the extraction; the refusal path is the safety net.
+```bash
+sudo ops/verify-stack.sh
+```
+
+It uses dummy credentials, a temporary database and volume, and non-production
+ports. It does not read `.env` or the legacy `/var/lib/feedsum` database.
+
+## Limitations
+
+- Video summarization currently supports YouTube only.
+- Pages that block extraction or provide too little article text fail with a
+  visible reason instead of asking the model to guess.
+- Avoid bulk-queuing a large backlog; it can exhaust model quotas and trigger
+  source-site rate limits.
 
 ## License
 

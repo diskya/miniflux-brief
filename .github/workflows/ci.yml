@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
 
 jobs:
   feedsum:
@@ -19,11 +21,11 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: pip install -r requirements-dev.txt
-      - run: pytest tests/test_feedsum.py -q
+      - run: >-
+          pytest -q tests/test_feedsum.py tests/test_app.py tests/test_store.py
+          tests/test_assets.py tests/test_migrate.py
 
   reader:
-    # Its own job: the reader pulls in a browser stack that feedsum never needs.
-    # The tests mock the fetchers, so no browser is installed here.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,10 +36,79 @@ jobs:
       - run: pip install -r reader/requirements.txt -r requirements-dev.txt
       - run: pytest tests/test_reader.py -q
 
-  docker:
+  quality:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Only the feedsum image: building the reader means downloading two
-      # browsers, which is not worth doing on every push.
-      - run: docker build -t miniflux-brief-feedsum .
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pip-audit -r requirements.txt
+      - run: pip-audit -r reader/requirements.txt
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: miniflux-brief-feedsum
+          cache-from: type=gha,scope=feedsum
+          cache-to: type=gha,mode=max,scope=feedsum
+      - uses: docker/build-push-action@v6
+        with:
+          context: reader-proxy
+          load: true
+          tags: miniflux-brief-reader-proxy
+          cache-from: type=gha,scope=reader-proxy
+          cache-to: type=gha,mode=max,scope=reader-proxy
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: reader/Dockerfile
+          load: true
+          tags: miniflux-brief-reader
+          cache-from: type=gha,scope=reader
+          cache-to: type=gha,mode=max,scope=reader
+      - name: Compose, browser tiers, wiring, and private-egress verification
+        env:
+          VERIFY_SKIP_BUILD: "1"
+        run: sudo --preserve-env=VERIFY_SKIP_BUILD ops/verify-stack.sh
+      - name: Report reader image findings, including unfixed browser packages
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: miniflux-brief-reader
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+      - name: Scan feedsum for fixable HIGH/CRITICAL findings
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: miniflux-brief-feedsum
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Scan egress proxy for fixable HIGH/CRITICAL findings
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: miniflux-brief-reader-proxy
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Scan reader for fixable HIGH/CRITICAL findings
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: miniflux-brief-reader
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"

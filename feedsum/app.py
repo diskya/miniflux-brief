@@ -1,166 +1,289 @@
-"""HTTP surface: a Miniflux webhook, and an on-demand endpoint for the reader UI.
-
-Summarizing takes tens of seconds, so nothing here does the work inline. A
-request records a pending row and queues a job; callers poll for the result.
-"""
+"""Authenticated HTTP API and generation-safe background job runner."""
 
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 import logging
 from contextlib import asynccontextmanager
-from typing import Any
+from dataclasses import dataclass
+from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from . import miniflux
 from .config import config
 from .render import markdown_to_html
-from .store import ERROR, PENDING, READY, Store, Summary
+from .store import ERROR, Store, Summary
 from .summarize import SummarizeError, summarize
 
-
-# uvicorn only configures its own loggers, so without this the service's own
-# INFO lines (key selection, retries) are dropped by the root logger.
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-# httpx logs every request URL at INFO. Credentials must never reach the journal.
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
 logger = logging.getLogger("feedsum")
 
 SUMMARY_HEADING = "Brief"
-
-
 MAX_STATUS_LOOKUP = 500
-
+MAX_WEBHOOK_BYTES = 1024 * 1024
+MAX_WEBHOOK_ENTRIES = 500
+MAX_ENTRY_ID = 2**63 - 1
 RESTART_ERROR = "Interrupted by a restart — click Brief to run it again."
+WRITEBACK_ERROR = "The brief was saved, but Miniflux write-back failed."
+UI_TOKEN_HEADER = "X-Feedsum-UI-Token"
 
-# A retry is a task that sleeps and then puts the job back on the queue. Holding
-# a reference keeps it from being garbage collected mid-wait, and gives shutdown
-# something to cancel.
-_retries: set[asyncio.Task] = set()
+PositiveEntryID = Annotated[int, Field(strict=True, gt=0, le=MAX_ENTRY_ID)]
 
 
 class SummaryRequest(BaseModel):
-    entry_id: int
+    model_config = ConfigDict(extra="forbid")
+    entry_id: PositiveEntryID
     force: bool = False
 
 
 class StatusRequest(BaseModel):
-    entry_ids: list[int]
+    model_config = ConfigDict(extra="forbid")
+    entry_ids: list[PositiveEntryID] = Field(max_length=MAX_STATUS_LOOKUP)
+
+
+class WebhookFeed(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: PositiveEntryID
+
+
+class WebhookEntry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    id: PositiveEntryID
+    url: str = Field(min_length=1, max_length=8192)
+    feed_id: PositiveEntryID | None = None
+    feed: WebhookFeed | None = None
+
+    @field_validator("url")
+    @classmethod
+    def require_http_url(cls, value: str) -> str:
+        try:
+            parts = urlsplit(value)
+        except ValueError as exc:
+            raise ValueError("invalid URL") from exc
+        if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+            raise ValueError("invalid URL")
+        return value
+
+    @property
+    def effective_feed_id(self) -> int | None:
+        return self.feed_id or (self.feed.id if self.feed else None)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkItem:
+    kind: Literal["summary", "writeback"]
+    entry_id: int
+    url: str
+    generation: int
+
+
+_retries: set[asyncio.Task] = set()
+_entry_locks: dict[int, asyncio.Lock] = {}
+
+
+def _entry_lock(entry_id: int) -> asyncio.Lock:
+    return _entry_locks.setdefault(entry_id, asyncio.Lock())
 
 
 def _build_content(summary_html: str, original: str) -> str:
-    heading = f"<h3>{SUMMARY_HEADING}</h3>"
-    return f"{heading}{summary_html}<hr>{original}"
+    return f"<h3>{SUMMARY_HEADING}</h3>{summary_html}<hr>{original}"
 
 
-async def _write_back(store: Store, entry_id: int, summary_html: str) -> None:
-    entry = await miniflux.get_entry(entry_id)
-    # Rebuild from the first content we ever saw, so repeats never stack up.
-    original = store.remember_original(entry_id, entry.get("content") or "")
-    await miniflux.set_entry_content(entry_id, _build_content(summary_html, original))
+async def _require_ui_token(
+    x_feedsum_ui_token: Annotated[str | None, Header(alias=UI_TOKEN_HEADER)] = None,
+) -> None:
+    supplied = x_feedsum_ui_token or ""
+    if not supplied or not hmac.compare_digest(supplied.encode(), config.ui_token.encode()):
+        raise HTTPException(status_code=401, detail="Invalid UI token.")
 
 
-async def _retry_later(queue: asyncio.Queue, entry_id: int, url: str, delay: int) -> None:
+async def _retry_later(queue: asyncio.Queue[WorkItem], item: WorkItem, delay: int) -> None:
     await asyncio.sleep(delay)
-    await queue.put((entry_id, url))
+    await queue.put(item)
 
 
-def _fail(
+def _schedule_retry(queue: asyncio.Queue[WorkItem], item: WorkItem, delay: int) -> None:
+    task = asyncio.create_task(_retry_later(queue, item, delay))
+    _retries.add(task)
+    task.add_done_callback(_retries.discard)
+
+
+def _fail_summary(
     store: Store,
-    queue: asyncio.Queue,
-    entry_id: int,
-    url: str,
+    queue: asyncio.Queue[WorkItem],
+    item: WorkItem,
     message: str,
     *,
     retryable: bool,
     attempt: int,
 ) -> None:
-    """Record a failure, or schedule another attempt if one is worth making.
-
-    An entry waiting to be retried stays pending, so the button keeps showing it
-    as in progress rather than flicking to red and back. The attempt count lives
-    in the database, which is what stops a restart from resetting the ladder and
-    retrying forever.
-    """
-
+    if not store.is_current(item.entry_id, item.generation):
+        return
     delays = config.retry_delays
     if retryable and attempt <= len(delays):
         delay = delays[attempt - 1]
         logger.info(
-            "entry %s: %s Retrying in %ds (attempt %d of %d).",
-            entry_id, message, delay, attempt + 1, len(delays) + 1,
+            "entry %s generation %s: retrying summary in %ds (attempt %d of %d)",
+            item.entry_id,
+            item.generation,
+            delay,
+            attempt + 1,
+            len(delays) + 1,
         )
-        task = asyncio.create_task(_retry_later(queue, entry_id, url, delay))
-        _retries.add(task)
-        task.add_done_callback(_retries.discard)
+        _schedule_retry(queue, item, delay)
         return
+    if store.finish(item.entry_id, generation=item.generation, status=ERROR, error=message):
+        logger.warning("entry %s generation %s: %s", item.entry_id, item.generation, message)
 
-    store.finish(entry_id, status=ERROR, error=message)
-    logger.warning("entry %s: %s", entry_id, message)
 
-
-async def _run_job(store: Store, queue: asyncio.Queue, entry_id: int, url: str) -> None:
-    attempt = store.bump_attempts(entry_id)
+async def _run_summary(store: Store, queue: asyncio.Queue[WorkItem], item: WorkItem) -> None:
+    attempt = store.bump_attempts(item.entry_id, item.generation)
+    if attempt is None:
+        return
     try:
-        brief = await asyncio.wait_for(summarize(url), timeout=config.job_timeout)
+        brief = await asyncio.wait_for(summarize(item.url), timeout=config.job_timeout)
     except SummarizeError as exc:
-        _fail(store, queue, entry_id, url, str(exc), retryable=exc.retryable, attempt=attempt)
+        _fail_summary(store, queue, item, str(exc), retryable=exc.retryable, attempt=attempt)
         return
-    except asyncio.TimeoutError:
-        _fail(store, queue, entry_id, url, "The summary timed out.", retryable=True, attempt=attempt)
+    except TimeoutError:
+        _fail_summary(
+            store,
+            queue,
+            item,
+            "The summary timed out.",
+            retryable=True,
+            attempt=attempt,
+        )
         return
-    except Exception as exc:  # Provider clients raise a variety of network errors.
-        logger.exception("entry %s failed: %s", entry_id, exc)
-        _fail(
-            store, queue, entry_id, url,
-            "The summary failed unexpectedly.", retryable=True, attempt=attempt,
+    except Exception as exc:
+        logger.exception(
+            "entry %s generation %s failed unexpectedly: %s",
+            item.entry_id,
+            item.generation,
+            type(exc).__name__,
+        )
+        _fail_summary(
+            store,
+            queue,
+            item,
+            "The summary failed unexpectedly.",
+            retryable=True,
+            attempt=attempt,
         )
         return
 
     summary_html = markdown_to_html(brief.markdown)
-    store.finish(
-        entry_id,
-        status=READY,
+    saved = store.complete_summary(
+        item.entry_id,
+        item.generation,
         source=brief.source,
         model=brief.model,
         payload=brief.as_payload(),
+        summary_html=summary_html,
+        write_back=config.write_back,
+    )
+    if saved and config.write_back:
+        await queue.put(WorkItem("writeback", item.entry_id, item.url, item.generation))
+
+
+async def _write_back(store: Store, item: WorkItem) -> None:
+    """Write once under the entry lock, so a newer claim cannot overtake it."""
+
+    async with _entry_lock(item.entry_id):
+        current = store.get(item.entry_id)
+        if current is None or current.generation != item.generation or not current.summary_html:
+            return
+        entry = await miniflux.get_entry(item.entry_id)
+        original = store.remember_original(
+            item.entry_id, entry.get("content") or "", generation=item.generation
+        )
+        if original is None or not store.is_current(item.entry_id, item.generation):
+            return
+        await miniflux.set_entry_content(
+            item.entry_id, _build_content(current.summary_html, original)
+        )
+
+
+async def _run_writeback(store: Store, queue: asyncio.Queue[WorkItem], item: WorkItem) -> None:
+    attempt = store.bump_writeback_attempts(item.entry_id, item.generation)
+    if attempt is None:
+        return
+    try:
+        await _write_back(store, item)
+    except miniflux.MinifluxError as exc:
+        retryable = exc.retryable
+        safe_detail = str(exc)
+    except Exception as exc:
+        logger.warning(
+            "entry %s generation %s write-back raised %s",
+            item.entry_id,
+            item.generation,
+            type(exc).__name__,
+        )
+        retryable = True
+        safe_detail = WRITEBACK_ERROR
+    else:
+        store.finish_writeback(item.entry_id, item.generation, successful=True)
+        return
+
+    if not store.is_current(item.entry_id, item.generation):
+        return
+    if retryable and attempt <= len(config.retry_delays):
+        delay = config.retry_delays[attempt - 1]
+        logger.info(
+            "entry %s generation %s: retrying write-back in %ds",
+            item.entry_id,
+            item.generation,
+            delay,
+        )
+        _schedule_retry(queue, item, delay)
+        return
+    store.finish_writeback(
+        item.entry_id,
+        item.generation,
+        successful=False,
+        error=safe_detail or WRITEBACK_ERROR,
     )
 
-    if config.write_back:
-        try:
-            await _write_back(store, entry_id, summary_html)
-        except Exception as exc:  # A failed write-back must not lose the summary.
-            logger.warning("entry %s: summary kept but not written back: %s", entry_id, exc)
 
-
-async def _worker(store: Store, queue: asyncio.Queue) -> None:
+async def _worker(store: Store, queue: asyncio.Queue[WorkItem]) -> None:
     while True:
-        entry_id, url = await queue.get()
+        item = await queue.get()
         try:
-            await _run_job(store, queue, entry_id, url)
+            if item.kind == "summary":
+                await _run_summary(store, queue, item)
+            else:
+                await _run_writeback(store, queue, item)
         finally:
             queue.task_done()
 
 
-async def _resume(store: Store, queue: asyncio.Queue) -> None:
-    """Pick up the jobs a restart interrupted.
-
-    Nothing else would: `claim` reads a pending row as work already under way, so
-    without this an entry caught mid-flight stays amber forever. Only a bounded
-    number are replayed — a restart during a large burst would otherwise queue
-    the whole burst again, and the providers notice.
-    """
-
+async def _resume(store: Store, queue: asyncio.Queue[WorkItem]) -> None:
     interrupted = store.pending_entries(config.resume_limit)
-    abandoned = store.abandon_pending(RESTART_ERROR, keep=[entry_id for entry_id, _ in interrupted])
-    for entry_id, url in interrupted:
-        await queue.put((entry_id, url))
-    if interrupted or abandoned:
-        logger.info("resumed %d interrupted entries, abandoned %d", len(interrupted), abandoned)
+    abandoned = store.abandon_pending(
+        RESTART_ERROR, keep=[entry_id for entry_id, _, _ in interrupted]
+    )
+    # Write-back does not spend provider quota or rerun the model, so resume all
+    # persisted writes. The summary replay cap remains the stampede protection.
+    writebacks = store.pending_writebacks()
+    for entry_id, url, generation in interrupted:
+        await queue.put(WorkItem("summary", entry_id, url, generation))
+    for entry_id, url, generation in writebacks:
+        await queue.put(WorkItem("writeback", entry_id, url, generation))
+    if interrupted or writebacks or abandoned:
+        logger.info(
+            "resumed %d summaries and %d write-backs; abandoned %d summaries",
+            len(interrupted),
+            len(writebacks),
+            abandoned,
+        )
 
 
 @asynccontextmanager
@@ -170,7 +293,8 @@ async def lifespan(app: FastAPI):
     app.state.queue = asyncio.Queue()
     await _resume(app.state.store, app.state.queue)
     app.state.workers = [
-        asyncio.create_task(_worker(app.state.store, app.state.queue)) for _ in range(config.concurrency)
+        asyncio.create_task(_worker(app.state.store, app.state.queue))
+        for _ in range(config.concurrency)
     ]
     try:
         yield
@@ -179,21 +303,30 @@ async def lifespan(app: FastAPI):
             task.cancel()
         await asyncio.gather(*app.state.workers, *_retries, return_exceptions=True)
         _retries.clear()
+        _entry_locks.clear()
         app.state.store.close()
 
 
 app = FastAPI(title="feedsum", lifespan=lifespan)
 
 
-def _state(request: Request) -> tuple[Store, asyncio.Queue]:
+def _state(request: Request) -> tuple[Store, asyncio.Queue[WorkItem]]:
     return request.app.state.store, request.app.state.queue
 
 
-async def _enqueue(store: Store, queue: asyncio.Queue, entry_id: int, url: str, *, force: bool = False) -> Summary:
-    summary, needs_work = store.claim(entry_id, url, force=force)
-    if needs_work:
-        await queue.put((entry_id, url))
-    return summary
+async def _enqueue(
+    store: Store,
+    queue: asyncio.Queue[WorkItem],
+    entry_id: int,
+    url: str,
+    *,
+    force: bool = False,
+) -> tuple[Summary, bool]:
+    async with _entry_lock(entry_id):
+        summary, needs_work = store.claim(entry_id, url, force=force)
+        if needs_work:
+            await queue.put(WorkItem("summary", entry_id, url, summary.generation))
+    return summary, needs_work
 
 
 @app.get("/healthz")
@@ -201,34 +334,30 @@ async def healthz() -> dict[str, bool]:
     return {"ok": True}
 
 
-@app.post("/v1/summaries")
+@app.post("/v1/summaries", dependencies=[Depends(_require_ui_token)])
 async def create_summary(body: SummaryRequest, request: Request) -> JSONResponse:
     store, queue = _state(request)
-    # The URL always comes from Miniflux, never from the caller, so this cannot
-    # be pointed at an arbitrary target.
     try:
         entry = await miniflux.get_entry(body.entry_id)
     except miniflux.MinifluxError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     url = entry.get("url") or ""
-    if not url:
-        raise HTTPException(status_code=422, detail="That entry has no link to read.")
-
-    summary = await _enqueue(store, queue, body.entry_id, url, force=body.force)
+    if not isinstance(url, str) or not url or len(url) > 8192:
+        raise HTTPException(status_code=422, detail="That entry has no valid link to read.")
+    summary, _ = await _enqueue(store, queue, body.entry_id, url, force=body.force)
     return JSONResponse(summary.as_dict())
 
 
-@app.post("/v1/summaries/status")
+@app.post("/v1/summaries/status", dependencies=[Depends(_require_ui_token)])
 async def summary_statuses(body: StatusRequest, request: Request) -> dict[str, str]:
-    """Which of these entries already have a brief, for one page of the list."""
-
     store, _ = _state(request)
-    wanted = body.entry_ids[:MAX_STATUS_LOOKUP]
-    return {str(entry_id): status for entry_id, status in store.statuses(wanted).items()}
+    return {str(entry_id): status for entry_id, status in store.statuses(body.entry_ids).items()}
 
 
-@app.get("/v1/summaries/{entry_id}")
-async def read_summary(entry_id: int, request: Request) -> JSONResponse:
+@app.get("/v1/summaries/{entry_id}", dependencies=[Depends(_require_ui_token)])
+async def read_summary(
+    entry_id: Annotated[int, Path(gt=0, le=MAX_ENTRY_ID)], request: Request
+) -> JSONResponse:
     store, _ = _state(request)
     summary = store.get(entry_id)
     if summary is None:
@@ -236,35 +365,70 @@ async def read_summary(entry_id: int, request: Request) -> JSONResponse:
     return JSONResponse(summary.as_dict())
 
 
+def _webhook_entries(payload: Any, event: str | None) -> list[WebhookEntry] | None:
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Webhook payload must be an object.")
+    try:
+        if event == "new_entries":
+            raw_entries = payload.get("entries")
+            if not isinstance(raw_entries, list):
+                raise HTTPException(status_code=422, detail="new_entries requires an entries list.")
+            if len(raw_entries) > MAX_WEBHOOK_ENTRIES:
+                raise HTTPException(status_code=413, detail="Too many webhook entries.")
+            return [WebhookEntry.model_validate(entry) for entry in raw_entries]
+        if event == "save_entry":
+            if not isinstance(payload.get("entry"), dict):
+                raise HTTPException(status_code=422, detail="save_entry requires an entry object.")
+            return [WebhookEntry.model_validate(payload["entry"])]
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail="Malformed webhook entry.") from exc
+    return None
+
+
 @app.post("/webhook")
 async def webhook(
     request: Request,
-    x_miniflux_signature: str | None = Header(default=None),
-    x_miniflux_event_type: str | None = Header(default=None),
+    x_miniflux_signature: Annotated[str | None, Header(alias="X-Miniflux-Signature")] = None,
+    x_miniflux_event_type: Annotated[
+        str | None, Header(alias="X-Miniflux-Event-Type", max_length=64)
+    ] = None,
 ) -> dict[str, Any]:
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="Webhook body is too large.")
     raw = await request.body()
+    if len(raw) > MAX_WEBHOOK_BYTES:
+        raise HTTPException(status_code=413, detail="Webhook body is too large.")
     if not miniflux.verify_signature(raw, x_miniflux_signature):
         raise HTTPException(status_code=401, detail="Invalid signature.")
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="Webhook body is not valid JSON.") from exc
 
-    payload = await request.json()
-    event = x_miniflux_event_type or payload.get("event_type")
-    if event == "new_entries":
-        entries = payload.get("entries") or []
-    elif event == "save_entry":
-        entries = [payload["entry"]] if payload.get("entry") else []
-    else:
+    body_event = payload.get("event_type") if isinstance(payload, dict) else None
+    event = x_miniflux_event_type or body_event
+    if event is not None and (not isinstance(event, str) or len(event) > 64):
+        raise HTTPException(status_code=422, detail="Malformed webhook event type.")
+    entries = _webhook_entries(payload, event)
+    if entries is None:
         return {"queued": 0, "ignored": event}
 
     store, queue = _state(request)
     queued = 0
     for entry in entries:
-        entry_id, url = entry.get("id"), entry.get("url")
-        feed_id = entry.get("feed_id") or (entry.get("feed") or {}).get("id")
-        if not entry_id or not url:
+        if (
+            event == "new_entries"
+            and config.feed_allowlist
+            and entry.effective_feed_id not in config.feed_allowlist
+        ):
             continue
-        if config.feed_allowlist and feed_id not in config.feed_allowlist:
-            continue
-        # A manual save is an explicit "do this one", so it re-runs.
-        await _enqueue(store, queue, int(entry_id), url, force=event == "save_entry")
-        queued += 1
+        _, needs_work = await _enqueue(
+            store,
+            queue,
+            entry.id,
+            entry.url,
+            force=event == "save_entry",
+        )
+        queued += int(needs_work)
     return {"queued": queued}

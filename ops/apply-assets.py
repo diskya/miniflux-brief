@@ -12,6 +12,7 @@ so doing both in one step means going to the database directly. Pass whatever
 your deployment needs to reach it:
 
     python3 ops/apply-assets.py --dry-run
+    FEEDSUM_UI_TOKEN=... python3 ops/apply-assets.py --dry-run
     python3 ops/apply-assets.py --psql "sudo -u postgres psql -d miniflux2"
     python3 ops/apply-assets.py --psql "docker compose exec -T db psql -U miniflux -d miniflux"
 """
@@ -19,15 +20,17 @@ your deployment needs to reach it:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-
 HERE = Path(__file__).resolve().parent
 # The first line of ops/custom.css. Everything from here down is ours to replace.
 MARKER = "/* feedsum -"
+TOKEN_ASSIGNMENT = 'const CONFIGURED_TOKEN = "__FEEDSUM_UI_TOKEN__";'
 
 
 def quote_tag(*bodies: str) -> str:
@@ -51,19 +54,43 @@ def run_psql(psql: list[str], sql: str, *, capture: bool) -> str:
     return result.stdout
 
 
+def render_javascript(template: str, token: str | None) -> str:
+    """Substitute one token as a JSON string without ever printing its value."""
+
+    if template.count(TOKEN_ASSIGNMENT) != 1:
+        raise SystemExit(f"ops/custom.js must contain exactly one {TOKEN_ASSIGNMENT!r}.")
+    value = token or "__FEEDSUM_UI_TOKEN__"
+    return template.replace(TOKEN_ASSIGNMENT, f"const CONFIGURED_TOKEN = {json.dumps(value)};")
+
+
+def merge_stylesheet(existing: str, bundled: str) -> tuple[str, int]:
+    """Preserve everything above the owned marker and replace only our CSS."""
+
+    kept = existing.split(MARKER)[0].rstrip()
+    return (f"{kept}\n\n{bundled}" if kept else bundled), len(kept)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
         "--psql",
         default="sudo -u postgres psql -d miniflux2",
         help="command that opens a psql session on the Miniflux database",
     )
     parser.add_argument("--user-id", type=int, default=1, help="Miniflux user id (default: 1)")
+    parser.add_argument(
+        "--ui-token-env",
+        default="FEEDSUM_UI_TOKEN",
+        help="environment variable containing the UI token (default: FEEDSUM_UI_TOKEN)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print what would change and stop")
     args = parser.parse_args()
 
     css = (HERE / "custom.css").read_text()
-    js = (HERE / "custom.js").read_text()
+    token = os.environ.get(args.ui_token_env) or None
+    js = render_javascript((HERE / "custom.js").read_text(), token)
     if not css.startswith(MARKER):
         sys.exit(f"ops/custom.css no longer starts with {MARKER!r}; update MARKER in this script.")
 
@@ -71,12 +98,15 @@ def main() -> None:
     existing = run_psql(
         psql, f"SELECT stylesheet FROM users WHERE id = {args.user_id}", capture=True
     ).rstrip("\n")
-    kept = existing.split(MARKER)[0].rstrip()
-    stylesheet = f"{kept}\n\n{css}" if kept else css
+    stylesheet, kept_bytes = merge_stylesheet(existing, css)
 
     if args.dry_run:
-        print(f"user {args.user_id}: keeping {len(kept)} bytes of your own CSS, "
-              f"writing {len(stylesheet)} bytes of stylesheet and {len(js)} bytes of custom JS")
+        token_mode = "embedded UI token" if token else "manual token prompt"
+        print(
+            f"user {args.user_id}: keeping {kept_bytes} bytes of your own CSS, "
+            f"writing {len(stylesheet)} bytes of stylesheet and {len(js)} bytes of custom JS "
+            f"({token_mode})"
+        )
         return
 
     tag = quote_tag(stylesheet, js)

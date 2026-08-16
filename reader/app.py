@@ -12,7 +12,6 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from .reader import ReaderError, read_article
 
-
 app = FastAPI(title="Article Reader")
 
 

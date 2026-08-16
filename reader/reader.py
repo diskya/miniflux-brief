@@ -6,19 +6,20 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import re
 import shutil
 import socket
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from functools import partial
-from typing import Any, Awaitable, Callable
+from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import trafilatura
 from lxml import html as lxml_html
 from scrapling.fetchers import AsyncFetcher, DynamicFetcher, StealthyFetcher
-
 
 NORMAL_ARTICLE_LENGTH = 500
 SHORT_ARTICLE_FLOOR = 120
@@ -166,7 +167,9 @@ async def validate_url(url: str) -> str:
                 type=socket.SOCK_STREAM,
             )
         except socket.gaierror as exc:
-            raise ReaderError(502, "dns_error", "The target hostname could not be resolved.") from exc
+            raise ReaderError(
+                502, "dns_error", "The target hostname could not be resolved."
+            ) from exc
         addresses = {record[4][0] for record in records}
 
     if not addresses or any(not _is_public_address(address) for address in addresses):
@@ -179,17 +182,20 @@ async def validate_url(url: str) -> str:
 def extract_article(html: str, final_url: str) -> tuple[str, dict[str, Any]]:
     """Extract Markdown and metadata from already-fetched HTML."""
 
-    markdown = trafilatura.extract(
-        html,
-        url=final_url,
-        output_format="markdown",
-        include_comments=False,
-        # These sites append "Up next" and "Explore more" rails to the article
-        # body. Balanced extraction keeps them, which reads as article text and
-        # silently poisons anything downstream. Precision drops them and leaves
-        # genuine long-form essays byte-for-byte identical.
-        favor_precision=True,
-    ) or ""
+    markdown = (
+        trafilatura.extract(
+            html,
+            url=final_url,
+            output_format="markdown",
+            include_comments=False,
+            # These sites append "Up next" and "Explore more" rails to the article
+            # body. Balanced extraction keeps them, which reads as article text and
+            # silently poisons anything downstream. Precision drops them and leaves
+            # genuine long-form essays byte-for-byte identical.
+            favor_precision=True,
+        )
+        or ""
+    )
     metadata = trafilatura.extract_metadata(html, default_url=final_url)
     return markdown, metadata.as_dict() if metadata else {}
 
@@ -307,9 +313,37 @@ def _page_size(page: Any) -> int:
 
 
 def _browser_runtime_options() -> dict[str, Any]:
-    if not SYSTEM_CHROME_PATH:
+    options: dict[str, Any] = {
+        # Chromium cannot tunnel QUIC through the mandatory HTTP proxy. Keeping
+        # it disabled also prevents any future UDP fallback from bypassing it.
+        "extra_flags": [
+            "--disable-quic",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        ],
+        "dns_over_https": False,
+    }
+    if SYSTEM_CHROME_PATH:
+        options.update({"real_chrome": True, "executable_path": SYSTEM_CHROME_PATH})
+    return options
+
+
+def _proxy_options() -> dict[str, str]:
+    """Return the mandatory proxy setting, unless direct mode was explicitly chosen."""
+
+    proxy = os.environ.get("READER_OUTBOUND_PROXY", "").strip()
+    if proxy:
+        try:
+            parsed = urlsplit(proxy)
+        except ValueError as exc:
+            raise ReaderError(
+                503, "proxy_configuration", "The outbound proxy setting is invalid."
+            ) from exc
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ReaderError(503, "proxy_configuration", "The outbound proxy setting is invalid.")
+        return {"proxy": proxy}
+    if os.environ.get("READER_ALLOW_DIRECT", "") == "1":
         return {}
-    return {"real_chrome": True, "executable_path": SYSTEM_CHROME_PATH}
+    raise ReaderError(503, "proxy_required", "The reader requires an outbound filtering proxy.")
 
 
 async def _static_once(url: str) -> Any:
@@ -320,6 +354,7 @@ async def _static_once(url: str) -> Any:
             timeout=FETCH_TIMEOUT_SECONDS,
             retries=SCRAPLING_ATTEMPTS,
             follow_redirects=False,
+            **_proxy_options(),
         )
         location = _header(page, "location")
         if int(getattr(page, "status", 0)) not in _REDIRECT_STATUSES or not location:
@@ -336,6 +371,7 @@ async def _dynamic_once(url: str) -> Any:
             timeout=BROWSER_TIMEOUT_MS,
             retries=SCRAPLING_ATTEMPTS,
             disable_resources=True,
+            **_proxy_options(),
             **_browser_runtime_options(),
         )
 
@@ -347,8 +383,10 @@ async def _stealth_once(url: str, *, solve_cloudflare: bool = False, settle_ms: 
             timeout=BROWSER_TIMEOUT_MS,
             retries=SCRAPLING_ATTEMPTS,
             disable_resources=True,
+            block_webrtc=True,
             solve_cloudflare=solve_cloudflare,
             wait=settle_ms,
+            **_proxy_options(),
             **_browser_runtime_options(),
         )
 
@@ -401,7 +439,9 @@ def _check_response(page: Any) -> None:
     if status in {401, 403, 404, 410}:
         raise ReaderError(status, "upstream_status", f"The target returned HTTP {status}.")
     if status >= 500:
-        raise ReaderError(502, "upstream_error", f"The target returned HTTP {status} after a retry.")
+        raise ReaderError(
+            502, "upstream_error", f"The target returned HTTP {status} after a retry."
+        )
     if status < 200 or status >= 300:
         raise ReaderError(502, "upstream_status", f"The target returned HTTP {status}.")
     if not _is_html(page):
@@ -416,7 +456,9 @@ async def _extract(page: Any) -> tuple[str, dict[str, Any], int]:
         markdown, metadata = await asyncio.to_thread(extract_article, html, str(page.url))
         length = await asyncio.to_thread(body_text_length, html)
     except Exception as exc:
-        raise ReaderError(422, "extraction_failed", "The returned HTML could not be extracted.") from exc
+        raise ReaderError(
+            422, "extraction_failed", "The returned HTML could not be extracted."
+        ) from exc
     return markdown, metadata, length
 
 
@@ -471,7 +513,9 @@ async def _read_article(url: str, started: float) -> ArticleResult:
         markdown, metadata, body_length = await _extract(page)
         if extraction_is_useful(markdown, body_length):
             return _result(url, page, markdown, metadata, "stealth", started)
-        raise ReaderError(422, "article_not_found", "No useful article was found after the challenge.")
+        raise ReaderError(
+            422, "article_not_found", "No useful article was found after the challenge."
+        )
 
     _check_response(page)
     markdown, metadata, body_length = await _extract(page)
@@ -484,7 +528,9 @@ async def _read_article(url: str, started: float) -> ArticleResult:
     markdown, metadata, body_length = await _extract(page)
     if extraction_is_useful(markdown, body_length):
         return _result(url, page, markdown, metadata, "dynamic", started)
-    raise ReaderError(422, "article_not_found", "No useful article was found after rendering JavaScript.")
+    raise ReaderError(
+        422, "article_not_found", "No useful article was found after rendering JavaScript."
+    )
 
 
 async def read_article(url: str) -> ArticleResult:
@@ -497,4 +543,6 @@ async def read_article(url: str) -> ArticleResult:
     except ReaderError:
         raise
     except TimeoutError as exc:
-        raise ReaderError(504, "timeout", "The article request exceeded its total time limit.") from exc
+        raise ReaderError(
+            504, "timeout", "The article request exceeded its total time limit."
+        ) from exc

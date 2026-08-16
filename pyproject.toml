@@ -49,3 +49,10 @@ testpaths = ["tests"]
 # Both services are imported from the repo root rather than installed.
 pythonpath = ["."]
 asyncio_mode = "strict"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

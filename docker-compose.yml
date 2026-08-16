@@ -1,49 +1,124 @@
-# feedsum and the reader. Miniflux itself is not here: this is an addition to a
-# Miniflux you already run. Point MINIFLUX_URL at it in .env — see that file for
-# the three usual cases (same host, another Compose project, another machine).
+# Miniflux itself is not part of this project. The reader has no interface on
+# an Internet-routed Docker network: it can only accept calls through a fixed
+# reverse gateway and make origin requests through the filtering proxy.
 
 services:
   feedsum:
     build: .
-    image: miniflux-brief-feedsum
+    image: ${FEEDSUM_IMAGE:-miniflux-brief-feedsum}
     restart: unless-stopped
-    env_file: .env
+    env_file: ${FEEDSUM_ENV_FILE:-.env}
     environment:
-      FEEDSUM_READER_URL: http://reader:8010
+      FEEDSUM_READER_URL: http://reader-gateway:8010
       FEEDSUM_DB: /data/feedsum.db
     volumes:
       - feedsum-data:/data
-    # Miniflux posts its webhook here, and the reverse proxy mounts this on the
-    # Miniflux origin. Loopback only: everything reaching it is already trusted.
-    # Change the left-hand side if port 8012 is taken.
     ports:
-      - "127.0.0.1:8012:8012"
-    # Lets MINIFLUX_URL reach a Miniflux running on the host itself.
+      - "127.0.0.1:${FEEDSUM_PORT:-8012}:8012"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
-      - brief
+      app:
     depends_on:
-      - reader
+      reader-gateway:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+
+  reader-gateway:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    user: "101:101"
+    command: ["nginx", "-c", "/etc/nginx/gateway.conf", "-g", "daemon off;"]
+    volumes:
+      - ./reader-proxy/gateway.conf:/etc/nginx/gateway.conf:ro
+    networks:
+      app:
+      reader-api:
+        ipv4_address: 172.30.40.3
+    depends_on:
+      reader:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8010/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 64m
+    cpus: 0.25
 
   reader:
     build:
       context: .
       dockerfile: reader/Dockerfile
-    image: miniflux-brief-reader
+    image: ${READER_IMAGE:-miniflux-brief-reader}
     restart: unless-stopped
-    # This service fetches whatever a feed points at, with a real browser for
-    # the harder pages. It refuses private addresses itself, but that check is
-    # only a second line of defence if the browser has nowhere private to go:
-    # it shares a network with feedsum and nothing else, reaches neither
-    # Miniflux nor the host, and publishes no port of its own.
+    environment:
+      READER_OUTBOUND_PROXY: http://egress-proxy:3128
     networks:
-      - brief
-    # Chromium wants more than the default 64MB of shared memory.
+      reader-api:
+        ipv4_address: 172.30.40.2
+      reader-egress:
+        ipv4_address: 172.30.40.19
+    depends_on:
+      egress-proxy:
+        condition: service_healthy
     shm_size: 512mb
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+      - /home/reader/.config:size=32m,uid=1102,gid=1102
+      - /home/reader/.local:size=32m,uid=1102,gid=1102
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2.0
+
+  egress-proxy:
+    build: ./reader-proxy
+    image: ${READER_PROXY_IMAGE:-miniflux-brief-reader-proxy}
+    restart: unless-stopped
+    networks:
+      reader-egress:
+        ipv4_address: 172.30.40.18
+      proxy-outbound:
+    read_only: true
+    tmpfs:
+      - /var/cache/squid:size=32m,uid=31,gid=31
+      - /var/log/squid:size=8m,uid=31,gid=31
+      - /run/squid:size=2m,uid=31,gid=31
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
 
 networks:
-  brief:
+  app:
+  reader-api:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.40.0/28
+  reader-egress:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.40.16/28
+  proxy-outbound:
 
 volumes:
   feedsum-data:

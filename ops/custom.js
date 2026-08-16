@@ -9,6 +9,9 @@
  */
 
 const BASE = "/_summary";
+const CONFIGURED_TOKEN = "__FEEDSUM_UI_TOKEN__";
+const TOKEN_PLACEHOLDER = "__FEEDSUM_UI_TOKEN__";
+const TOKEN_STORAGE_KEY = "feedsum-ui-token";
 const POLL_MS = 4000;
 const POLL_LIMIT = 90; // ~6 minutes, enough for a long video.
 
@@ -111,16 +114,45 @@ function showSummary(panel, data) {
   const source = el("p", "feedsum-source");
   source.textContent = `${data.source === "youtube" ? "video" : "article"} · ${data.model || ""}`;
   panel.appendChild(source);
+  const writeBack = data.write_back || {};
+  if (writeBack.status === "pending") {
+    const warning = el("p", "feedsum-warning");
+    warning.textContent = "Brief ready; saving it into Miniflux is still pending.";
+    panel.appendChild(warning);
+  } else if (writeBack.status === "failed") {
+    const warning = el("p", "feedsum-warning");
+    warning.textContent = writeBack.error || "Brief ready, but it could not be saved into Miniflux.";
+    panel.appendChild(warning);
+  }
+}
+
+function uiToken() {
+  if (CONFIGURED_TOKEN !== TOKEN_PLACEHOLDER) return CONFIGURED_TOKEN;
+  let token = sessionStorage.getItem(TOKEN_STORAGE_KEY) || "";
+  if (!token) {
+    token = window.prompt("Paste the feedsum UI token for this browser session:") || "";
+    if (token) sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+  }
+  if (!token) throw new Error("A feedsum UI token is required.");
+  return token;
 }
 
 async function call(path, options) {
   const response = await fetch(BASE + path, {
     credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
     ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ["X-Feedsum-UI-Token"]: uiToken(),
+      ...(options.headers || {}),
+    },
   });
-  if (response.status === 401 || response.redirected) {
-    throw new Error("Your session expired — reload the page.");
+  if (response.status === 401) {
+    sessionStorage.removeItem(TOKEN_STORAGE_KEY);
+    throw new Error("The feedsum UI token was rejected — paste it again.");
+  }
+  if (response.redirected) {
+    throw new Error("Your Miniflux session expired — reload the page.");
   }
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.detail || `Request failed (${response.status}).`);
