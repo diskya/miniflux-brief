@@ -167,6 +167,13 @@ async def validate_url(url: str) -> str:
                 type=socket.SOCK_STREAM,
             )
         except socket.gaierror as exc:
+            # In Compose the reader sits only on internal networks, where Docker's
+            # resolver does not answer external names. The mandatory proxy
+            # resolves the name itself and refuses non-public destinations.
+            if os.environ.get("READER_OUTBOUND_PROXY", "").strip():
+                return urlunsplit(
+                    (parsed.scheme.lower(), parsed.netloc, parsed.path or "/", parsed.query, "")
+                )
             raise ReaderError(
                 502, "dns_error", "The target hostname could not be resolved."
             ) from exc

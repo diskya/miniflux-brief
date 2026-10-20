@@ -288,6 +288,27 @@ async def test_url_safeguards_reject_non_public_targets(monkeypatch, url):
 
 
 @pytest.mark.asyncio
+async def test_unresolvable_name_defers_to_the_proxy(monkeypatch):
+    def unresolvable(*args, **kwargs):
+        raise reader.socket.gaierror("no resolver")
+
+    monkeypatch.undo()
+    monkeypatch.setattr(reader.socket, "getaddrinfo", unresolvable)
+    monkeypatch.setenv("READER_OUTBOUND_PROXY", "http://proxy.test:3128")
+    assert await reader.validate_url("https://Example.com/a?b=1#c") == "https://Example.com/a?b=1"
+
+    monkeypatch.delenv("READER_OUTBOUND_PROXY")
+    with pytest.raises(reader.ReaderError) as caught:
+        await reader.validate_url("https://example.com/")
+    assert caught.value.code == "dns_error"
+
+    monkeypatch.setenv("READER_OUTBOUND_PROXY", "http://proxy.test:3128")
+    for blocked in ("http://localhost/x", "http://10.0.0.1/x"):
+        with pytest.raises(reader.ReaderError):
+            await reader.validate_url(blocked)
+
+
+@pytest.mark.asyncio
 async def test_final_redirect_target_is_validated(monkeypatch):
     monkeypatch.undo()
     page = FakePage("<html></html>", url="http://169.254.169.254/latest/meta-data")

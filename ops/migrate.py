@@ -122,6 +122,9 @@ def seed_volume(backup: Path, volume: str) -> None:
             "alpine:3.22",
             "sh",
             "-c",
+            # SQLite creates its -wal and -shm files beside the database, so the
+            # directory must belong to the feedsum user too, not just the file.
+            "chown 1101:1101 /data && "
             f"install -o 1101 -g 1101 -m 0600 /source/{backup.name} /data/feedsum.db",
         ]
     )
