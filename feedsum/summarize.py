@@ -2,7 +2,8 @@
 
 Two routes, because the useful input differs. Gemini watches a YouTube video
 directly, so there is no transcript step. Everything else is extracted to text
-by the reader service first and then summarized by an OpenAI-compatible model.
+by the reader service first and then summarized by Gemini too, or by an
+OpenAI-compatible model when one is configured.
 """
 
 from __future__ import annotations
@@ -162,7 +163,9 @@ _preferred_key = 0
 _RETRY_BACKOFF_SECONDS = (5, 15)
 
 
-async def _gemini_generate(client: httpx.AsyncClient, video_id: str) -> httpx.Response | None:
+async def _gemini_generate(
+    client: httpx.AsyncClient, parts: list[dict], *, system: str | None = None
+) -> httpx.Response | None:
     """Ask the last key that worked, then the others, retrying while they are busy."""
 
     global _preferred_key
@@ -171,11 +174,15 @@ async def _gemini_generate(client: httpx.AsyncClient, video_id: str) -> httpx.Re
     if not keys:
         return None
     endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{config.gemini_model}:generateContent"
-    watch_url = f"https://www.youtube.com/watch?v={video_id}"
-    payload = {
-        "contents": [{"parts": [{"file_data": {"file_uri": watch_url}}, {"text": TASK}]}],
-        "generationConfig": {"maxOutputTokens": config.max_summary_tokens},
+    payload: dict = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "maxOutputTokens": config.max_summary_tokens + config.gemini_thinking_tokens,
+            "thinkingConfig": {"thinkingBudget": config.gemini_thinking_tokens},
+        },
     }
+    if system:
+        payload["system_instruction"] = {"parts": [{"text": system}]}
 
     last: httpx.Response | None = None
     for pause in (0, *_RETRY_BACKOFF_SECONDS):
@@ -207,13 +214,17 @@ async def _gemini_generate(client: httpx.AsyncClient, video_id: str) -> httpx.Re
     return last
 
 
-async def _summarize_youtube(client: httpx.AsyncClient, url: str, video_id: str) -> Brief:
-    response = await _gemini_generate(client, video_id)
+async def _gemini_reply(
+    client: httpx.AsyncClient, what: str, parts: list[dict], *, system: str | None = None
+) -> str:
+    """Return Gemini's reply about the video or article, or raise why there is none."""
+
+    response = await _gemini_generate(client, parts, system=system)
     if response is None or response.status_code != 200:
         # No key at all is a configuration mistake and will not fix itself; an
         # exhausted quota or an overloaded model will.
         transient = response is not None and response.status_code in _RETRYABLE_STATUSES
-        raise SummarizeError(_gemini_error(response), retryable=transient)
+        raise SummarizeError(_gemini_error(response, what), retryable=transient)
 
     body = response.json()
     candidates = body.get("candidates") or []
@@ -221,16 +232,24 @@ async def _summarize_youtube(client: httpx.AsyncClient, url: str, video_id: str)
         # A refusal or a video Gemini could not open arrives with no candidate.
         blocked = (body.get("promptFeedback") or {}).get("blockReason")
         raise SummarizeError(
-            f"Gemini returned no summary for the video ({blocked or 'no candidates'})."
+            f"Gemini returned no summary for the {what} ({blocked or 'no candidates'})."
         )
-    parts = (candidates[0].get("content") or {}).get("parts") or []
-    text = "".join(part.get("text", "") for part in parts).strip()
+    reply = (candidates[0].get("content") or {}).get("parts") or []
+    text = "".join(part.get("text", "") for part in reply).strip()
     if not text:
-        raise SummarizeError("Gemini returned an empty summary for the video.")
+        raise SummarizeError(f"Gemini returned an empty summary for the {what}.")
+    return text
+
+
+async def _summarize_youtube(client: httpx.AsyncClient, url: str, video_id: str) -> Brief:
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    text = await _gemini_reply(
+        client, "video", [{"file_data": {"file_uri": watch_url}}, {"text": TASK}]
+    )
     return Brief(markdown=_validate_brief_shape(text), source="youtube", model=config.gemini_model)
 
 
-def _gemini_error(response: httpx.Response | None) -> str:
+def _gemini_error(response: httpx.Response | None, what: str) -> str:
     if response is None:
         return "No Gemini API key is configured."
     try:
@@ -242,7 +261,7 @@ def _gemini_error(response: httpx.Response | None) -> str:
     scope = "every configured key" if keys > 1 else "the configured key"
     if response.status_code == 429:
         return f"Gemini quota exhausted on {scope} for now."
-    return f"Gemini rejected the video request ({status})."
+    return f"Gemini rejected the {what} request ({status})."
 
 
 async def _read_article(
@@ -301,6 +320,25 @@ async def _summarize_article(client: httpx.AsyncClient, url: str) -> Brief:
         brief.title = title or brief.title
         return brief
 
+    prompt = f"Title: {title or 'Unknown'}\nURL: {url}\n\n{article}"
+    if config.openai_base:
+        text, model = await _openai_reply(client, prompt), config.text_model
+    else:
+        text = await _gemini_reply(client, "article", [{"text": prompt}], system=TASK)
+        model = config.gemini_model
+    # The model still reads the page first, since an essay may also declare a
+    # film. Only when it finds nothing but a blurb is the blurb shown as is.
+    if video_host and text.upper().startswith(UNUSABLE_PREFIX):
+        return Brief(
+            markdown=_unsupported_video_brief(video_host, article),
+            source="excerpt",
+            model=model,
+            title=title,
+        )
+    return Brief(markdown=_validate_brief_shape(text), source="article", model=model, title=title)
+
+
+async def _openai_reply(client: httpx.AsyncClient, prompt: str) -> str:
     response = await client.post(
         f"{config.openai_base.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {config.openai_key}"},
@@ -309,10 +347,7 @@ async def _summarize_article(client: httpx.AsyncClient, url: str) -> Brief:
             "max_tokens": config.max_summary_tokens,
             "messages": [
                 {"role": "system", "content": TASK},
-                {
-                    "role": "user",
-                    "content": f"Title: {title or 'Unknown'}\nURL: {url}\n\n{article}",
-                },
+                {"role": "user", "content": prompt},
             ],
         },
     )
@@ -325,18 +360,7 @@ async def _summarize_article(client: httpx.AsyncClient, url: str) -> Brief:
     text = (((choices[0] if choices else {}).get("message") or {}).get("content") or "").strip()
     if not text:
         raise SummarizeError("The summarizer returned an empty response.")
-    # The model still reads the page first, since an essay may also declare a
-    # film. Only when it finds nothing but a blurb is the blurb shown as is.
-    if video_host and text.upper().startswith(UNUSABLE_PREFIX):
-        return Brief(
-            markdown=_unsupported_video_brief(video_host, article),
-            source="excerpt",
-            model=config.text_model,
-            title=title,
-        )
-    return Brief(
-        markdown=_validate_brief_shape(text), source="article", model=config.text_model, title=title
-    )
+    return text
 
 
 async def summarize(url: str) -> Brief:

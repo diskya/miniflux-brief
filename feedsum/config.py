@@ -43,16 +43,17 @@ class Config:
         default_factory=lambda: os.environ.get("FEEDSUM_READER_URL", "http://127.0.0.1:8010")
     )
 
-    # YouTube: Gemini reads the video itself, so no transcript step is needed.
-    # Optional — without a key, video entries fail and articles are unaffected.
-    # Several keys may be listed; each has its own quota, so exhausting one only
-    # moves work to the next.
+    # Gemini writes every brief: it watches a YouTube video itself, so no
+    # transcript step is needed, and it summarizes articles too unless an
+    # OpenAI-compatible endpoint is set below. Several keys may be listed; each
+    # has its own quota, so exhausting one only moves work to the next.
     gemini_keys: tuple[str, ...] = field(default_factory=lambda: _keys("GEMINI_API_KEY"))
     gemini_model: str = field(
-        default_factory=lambda: os.environ.get("FEEDSUM_GEMINI_MODEL", "gemini-3.7-flash")
+        default_factory=lambda: os.environ.get("FEEDSUM_GEMINI_MODEL", "gemini-3.8-flash")
     )
 
-    # Articles: any OpenAI-compatible endpoint — a provider, or a local runtime.
+    # Optional: articles go to this OpenAI-compatible endpoint instead — a
+    # provider, or a local runtime. Gemini keys are then needed only for video.
     openai_base: str = field(default_factory=lambda: os.environ.get("OPENAI_API_BASE", ""))
     openai_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
     text_model: str = field(default_factory=lambda: os.environ.get("FEEDSUM_TEXT_MODEL", ""))
@@ -93,6 +94,10 @@ class Config:
     # Enough for 3–5 takeaways and two short assessments, while bounding spend
     # and preventing a broken provider from returning an unbounded document.
     max_summary_tokens: int = 1_200
+    # Gemini thinks before it answers, and the thinking counts towards the same
+    # output limit: without an allowance of its own it can use up the limit and
+    # cut the brief off mid-sentence. This caps it and is added to the limit.
+    gemini_thinking_tokens: int = 2_048
     # How long to wait before each further attempt at an entry that failed for a
     # reason unrelated to the entry itself. Spread wide, because the common cause
     # is an exhausted daily quota. Empty would disable retrying.
@@ -109,19 +114,20 @@ class Config:
     resume_limit: int = 20
 
     def require(self) -> None:
-        missing = [
-            name
-            for name, value in (
-                ("MINIFLUX_URL", self.miniflux_url),
-                ("MINIFLUX_API_TOKEN", self.miniflux_token),
-                ("FEEDSUM_WEBHOOK_SECRET", self.webhook_secret),
-                ("FEEDSUM_UI_TOKEN", self.ui_token),
-                ("OPENAI_API_BASE", self.openai_base),
+        required = [
+            ("MINIFLUX_URL", self.miniflux_url),
+            ("MINIFLUX_API_TOKEN", self.miniflux_token),
+            ("FEEDSUM_WEBHOOK_SECRET", self.webhook_secret),
+            ("FEEDSUM_UI_TOKEN", self.ui_token),
+        ]
+        if self.openai_base:
+            required += [
                 ("OPENAI_API_KEY", self.openai_key),
                 ("FEEDSUM_TEXT_MODEL", self.text_model),
-            )
-            if not value
-        ]
+            ]
+        else:
+            required.append(("GEMINI_API_KEY", ",".join(self.gemini_keys)))
+        missing = [name for name, value in required if not value]
         if missing:
             raise RuntimeError(f"Missing required configuration: {', '.join(missing)}")
 

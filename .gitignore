@@ -4,8 +4,11 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# Real configuration and real data never belong in the repository.
+# Real configuration and real data never belong in the repository, nor do
+# copies of the configuration kept as backups.
 .env
+.env.*
+!.env.example
 *.db
 *.db-wal
 *.db-shm

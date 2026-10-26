@@ -35,6 +35,9 @@ def test_youtube_id_detection(url, expected):
     assert youtube_id(url) == expected
 
 
+VIDEO = [{"file_data": {"file_uri": "https://www.youtube.com/watch?v=iNyUmbmQQZg"}}]
+
+
 def use_keys(monkeypatch, keys, preferred=0, backoff=()):
     """Config is frozen, so swap in a copy carrying the keys under test."""
     monkeypatch.setattr(summarize, "config", replace(summarize.config, gemini_keys=keys))
@@ -71,13 +74,15 @@ async def test_an_exhausted_key_falls_through_to_the_next(monkeypatch):
     use_keys(monkeypatch, ("key-a", "key-b", "key-c"))
     client = FakeClient([429, 503, 200])
 
-    response = await summarize._gemini_generate(client, "iNyUmbmQQZg")
+    response = await summarize._gemini_generate(client, VIDEO)
 
     assert response.status_code == 200
     assert client.keys_tried == ["key-a", "key-b", "key-c"]
-    assert client.payloads[0]["generationConfig"]["maxOutputTokens"] == (
-        summarize.config.max_summary_tokens
-    )
+    # Thinking has its own allowance, so it can never crowd out the brief.
+    generation = client.payloads[0]["generationConfig"]
+    thinking = summarize.config.gemini_thinking_tokens
+    assert generation["thinkingConfig"] == {"thinkingBudget": thinking}
+    assert generation["maxOutputTokens"] == summarize.config.max_summary_tokens + thinking
 
 
 @pytest.mark.asyncio
@@ -85,7 +90,7 @@ async def test_a_working_key_is_not_abandoned(monkeypatch):
     use_keys(monkeypatch, ("key-a", "key-b"))
     client = FakeClient([200])
 
-    await summarize._gemini_generate(client, "iNyUmbmQQZg")
+    await summarize._gemini_generate(client, VIDEO)
 
     assert client.keys_tried == ["key-a"]
 
@@ -96,7 +101,7 @@ async def test_a_rejected_request_is_not_retried_on_other_keys(monkeypatch):
     use_keys(monkeypatch, ("key-a", "key-b"))
     client = FakeClient([400])
 
-    response = await summarize._gemini_generate(client, "iNyUmbmQQZg")
+    response = await summarize._gemini_generate(client, VIDEO)
 
     assert response.status_code == 400
     assert client.keys_tried == ["key-a"]
@@ -107,21 +112,21 @@ async def test_exhausting_every_key_reports_the_last_failure(monkeypatch):
     use_keys(monkeypatch, ("key-a", "key-b"))
     client = FakeClient([429, 429])
 
-    response = await summarize._gemini_generate(client, "iNyUmbmQQZg")
+    response = await summarize._gemini_generate(client, VIDEO)
 
     assert response.status_code == 429
     assert client.keys_tried == ["key-a", "key-b"]
-    assert "every configured key" in summarize._gemini_error(response)
+    assert "every configured key" in summarize._gemini_error(response, "video")
 
 
 @pytest.mark.asyncio
 async def test_the_working_key_is_remembered_for_the_next_request(monkeypatch):
     use_keys(monkeypatch, ("key-a", "key-b"))
-    await summarize._gemini_generate(FakeClient([429, 200]), "iNyUmbmQQZg")
+    await summarize._gemini_generate(FakeClient([429, 200]), VIDEO)
 
     # The next request must not spend a round trip on the exhausted key again.
     second = FakeClient([200])
-    await summarize._gemini_generate(second, "iNyUmbmQQZg")
+    await summarize._gemini_generate(second, VIDEO)
     assert second.keys_tried == ["key-b"]
 
 
@@ -132,7 +137,7 @@ async def test_the_preferred_key_wraps_back_round_when_it_is_spent(monkeypatch):
     use_keys(monkeypatch, ("key-a", "key-b"), preferred=1)
     client = FakeClient([429, 200])
 
-    await summarize._gemini_generate(client, "iNyUmbmQQZg")
+    await summarize._gemini_generate(client, VIDEO)
 
     assert client.keys_tried == ["key-b", "key-a"]
 
@@ -144,7 +149,7 @@ async def test_a_busy_model_is_retried_after_every_key_was_tried(monkeypatch):
     use_keys(monkeypatch, ("key-a", "key-b"), backoff=(0, 0))
     client = FakeClient([503, 503, 503, 503, 200])
 
-    response = await summarize._gemini_generate(client, "iNyUmbmQQZg")
+    response = await summarize._gemini_generate(client, VIDEO)
 
     assert response.status_code == 200
     assert client.keys_tried == ["key-a", "key-b", "key-a", "key-b", "key-a"]
@@ -153,8 +158,8 @@ async def test_a_busy_model_is_retried_after_every_key_was_tried(monkeypatch):
 @pytest.mark.asyncio
 async def test_no_configured_key_is_reported_clearly(monkeypatch):
     use_keys(monkeypatch, ())
-    assert await summarize._gemini_generate(FakeClient([]), "iNyUmbmQQZg") is None
-    assert "No Gemini API key" in summarize._gemini_error(None)
+    assert await summarize._gemini_generate(FakeClient([]), VIDEO) is None
+    assert "No Gemini API key" in summarize._gemini_error(None, "video")
 
 
 def test_keys_are_parsed_from_one_or_many(monkeypatch):
@@ -195,16 +200,22 @@ def test_brief_shape_is_validated_before_rendering():
 
 
 class FakeArticleClient:
-    """Serves one reader response and one text-model reply."""
+    """Serves one reader response and one model reply, in the shape of its API."""
 
     def __init__(self, reader_body: dict, reply: str) -> None:
         self.reader_body = reader_body
         self.reply = reply
+        self.posts: list[tuple[str, dict, dict]] = []
 
     async def get(self, _url, params=None, timeout=None):
         return FakeJSONResponse(self.reader_body)
 
-    async def post(self, _url, headers=None, json=None):
+    async def post(self, url, headers=None, json=None):
+        self.posts.append((url, headers, json))
+        if "generativelanguage" in url:
+            return FakeJSONResponse(
+                {"candidates": [{"content": {"parts": [{"text": self.reply}]}}]}
+            )
         return FakeJSONResponse({"choices": [{"message": {"content": self.reply}}]})
 
 
@@ -218,12 +229,25 @@ class FakeJSONResponse:
         return self.body
 
 
+@pytest.fixture(params=["gemini", "openai"])
+def article_route(request, monkeypatch):
+    """Articles behave the same whichever model summarizes them."""
+
+    settings = {
+        "gemini": {"openai_base": "", "gemini_keys": ("key-a",)},
+        "openai": {"openai_base": "http://provider/v1", "openai_key": "token", "text_model": "m"},
+    }[request.param]
+    monkeypatch.setattr(summarize, "config", replace(summarize.config, **settings))
+    monkeypatch.setattr(summarize, "_preferred_key", 0)
+    return request.param
+
+
 BLURB = "A filmmaker revisits her brother's fading memory in a mixed-media short."
 VALID_BRIEF = "1. One\n2. Two\n3. Three\n\n---\n\n## Good\nYes.\n\n## Gap\nNo."
 
 
 @pytest.mark.asyncio
-async def test_a_blurb_for_an_unsupported_video_is_shown_instead_of_failing():
+async def test_a_blurb_for_an_unsupported_video_is_shown_instead_of_failing(article_route):
     client = FakeArticleClient(
         {"text": BLURB, "title": "Spaces", "video_url": None, "video_host": "vimeo.com"},
         "UNUSABLE: only a short blurb for a video.",
@@ -237,7 +261,7 @@ async def test_a_blurb_for_an_unsupported_video_is_shown_instead_of_failing():
 
 
 @pytest.mark.asyncio
-async def test_an_essay_that_declares_a_video_is_still_summarized():
+async def test_an_essay_that_declares_a_video_is_still_summarized(article_route):
     client = FakeArticleClient(
         {"text": "A long essay.", "title": "Essay", "video_host": "vimeo.com"}, VALID_BRIEF
     )
@@ -248,14 +272,29 @@ async def test_an_essay_that_declares_a_video_is_still_summarized():
 
 
 @pytest.mark.asyncio
-async def test_a_blurb_without_an_unsupported_video_still_fails():
+async def test_a_blurb_without_an_unsupported_video_still_fails(article_route):
     client = FakeArticleClient({"text": BLURB, "title": "Paywall"}, "UNUSABLE: a paywall.")
 
     with pytest.raises(SummarizeError, match="No brief"):
         await summarize._summarize_article(client, "https://example.com/a")
 
 
-def test_all_non_gemini_credentials_fail_fast():
+@pytest.mark.asyncio
+@pytest.mark.parametrize("article_route", ["gemini"], indirect=True)
+async def test_articles_go_to_gemini_with_the_brief_task_as_system_instruction(article_route):
+    client = FakeArticleClient({"text": "A long essay.", "title": "Essay"}, VALID_BRIEF)
+
+    brief = await summarize._summarize_article(client, "https://aeon.co/essays/a")
+
+    url, headers, payload = client.posts[0]
+    assert url.endswith(f"/models/{summarize.config.gemini_model}:generateContent")
+    assert headers == {"x-goog-api-key": "key-a"}
+    assert payload["system_instruction"]["parts"][0]["text"] == summarize.TASK
+    assert payload["contents"][0]["parts"][0]["text"].endswith("A long essay.")
+    assert (brief.source, brief.model) == ("article", summarize.config.gemini_model)
+
+
+def test_an_openai_endpoint_needs_its_key_and_model():
     complete = replace(
         app_module.config,
         miniflux_url="http://miniflux",
@@ -273,12 +312,28 @@ def test_all_non_gemini_credentials_fail_fast():
         ("miniflux_token", "MINIFLUX_API_TOKEN"),
         ("webhook_secret", "FEEDSUM_WEBHOOK_SECRET"),
         ("ui_token", "FEEDSUM_UI_TOKEN"),
-        ("openai_base", "OPENAI_API_BASE"),
         ("openai_key", "OPENAI_API_KEY"),
         ("text_model", "FEEDSUM_TEXT_MODEL"),
     ):
         with pytest.raises(RuntimeError, match=setting):
             replace(complete, **{field: ""}).require()
+
+
+def test_without_an_openai_endpoint_gemini_keys_are_required():
+    gemini_only = replace(
+        app_module.config,
+        miniflux_url="http://miniflux",
+        miniflux_token="miniflux-token",
+        webhook_secret="webhook-secret",
+        ui_token="ui-token",
+        openai_base="",
+        openai_key="",
+        text_model="",
+        gemini_keys=("key-a",),
+    )
+    gemini_only.require()
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY"):
+        replace(gemini_only, gemini_keys=()).require()
 
 
 def test_render_covers_the_shape_the_prompt_asks_for():

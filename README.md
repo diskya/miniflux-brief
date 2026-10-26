@@ -12,8 +12,9 @@ Each brief contains:
 - strengths
 - a short critique
 
-Articles use any OpenAI-compatible text model. YouTube videos can optionally be
-sent directly to Gemini.
+Gemini writes the briefs: it watches YouTube videos directly and summarizes
+articles from their extracted text. Articles can optionally go to any
+OpenAI-compatible model instead.
 
 ## What it does
 
@@ -29,8 +30,8 @@ sent directly to Gemini.
 
 - An existing Miniflux installation
 - Docker Engine with Docker Compose v2
-- An OpenAI-compatible API endpoint, key, and model name
-- Optional: a Gemini API key for YouTube videos
+- One or more Gemini API keys
+- Optional: an OpenAI-compatible API endpoint, key, and model name for articles
 
 ## Install
 
@@ -126,10 +127,11 @@ The button colors show the current state:
 | `MINIFLUX_API_TOKEN` | Reads entries and writes briefs back |
 | `FEEDSUM_WEBHOOK_SECRET` | Verifies Miniflux webhook signatures |
 | `FEEDSUM_UI_TOKEN` | Protects the optional Brief API and button |
-| `OPENAI_API_BASE` | OpenAI-compatible `/v1` endpoint |
-| `OPENAI_API_KEY` | API credential; use any non-empty value for local Ollama |
-| `FEEDSUM_TEXT_MODEL` | Model used for articles |
-| `GEMINI_API_KEY` | Optional, comma-separated keys for YouTube videos |
+| `GEMINI_API_KEY` | Comma-separated Gemini keys, tried in turn as quotas run out |
+| `FEEDSUM_GEMINI_MODEL` | Gemini model for videos and articles |
+| `OPENAI_API_BASE` | Optional OpenAI-compatible `/v1` endpoint for articles |
+| `OPENAI_API_KEY` | Its credential; use any non-empty value for local Ollama |
+| `FEEDSUM_TEXT_MODEL` | Its model for articles |
 | `FEEDSUM_FEED_IDS` | Optional feed-ID allowlist for automatic briefs |
 | `FEEDSUM_WRITE_BACK` | Set to `0` to keep briefs out of entry content |
 
