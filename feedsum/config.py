@@ -97,10 +97,15 @@ class Config:
     # reason unrelated to the entry itself. Spread wide, because the common cause
     # is an exhausted daily quota. Empty would disable retrying.
     retry_delays: tuple[int, ...] = (120, 900, 3600)
+    # When every attempt above failed for such a reason, the entry is marked
+    # failed but not given up on: it is started over after each of these longer
+    # pauses in turn. A provider can be down for an afternoon, and a brief that
+    # arrives the next day is still worth having. Empty would make it final.
+    auto_retry_delays: tuple[int, ...] = (3 * 3600, 6 * 3600, 12 * 3600, 24 * 3600)
     # A restart interrupts whatever was in flight. Those entries are picked up
     # again on the next start, but only this many: the rest are marked failed
-    # rather than replayed, so a restart during a large burst cannot stampede
-    # the providers. They stay one click away.
+    # and left to the automatic retries, which start one entry at a time, so a
+    # restart during a large burst cannot stampede the providers.
     resume_limit: int = 20
 
     def require(self) -> None:

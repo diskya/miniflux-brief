@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS summaries (
     writeback_status   TEXT NOT NULL DEFAULT 'disabled',
     writeback_error    TEXT,
     writeback_attempts INTEGER NOT NULL DEFAULT 0,
+    retry_at           REAL,
+    auto_retries       INTEGER NOT NULL DEFAULT 0,
     created_at         REAL NOT NULL,
     updated_at         REAL NOT NULL
 );
@@ -45,6 +47,8 @@ MIGRATIONS = (
         "writeback_attempts",
         "ALTER TABLE summaries ADD COLUMN writeback_attempts INTEGER NOT NULL DEFAULT 0",
     ),
+    ("retry_at", "ALTER TABLE summaries ADD COLUMN retry_at REAL"),
+    ("auto_retries", "ALTER TABLE summaries ADD COLUMN auto_retries INTEGER NOT NULL DEFAULT 0"),
 )
 
 PENDING = "pending"
@@ -71,6 +75,9 @@ class Summary:
     writeback_status: str = WRITEBACK_DISABLED
     writeback_error: str | None = None
     writeback_attempts: int = 0
+    # When a failed entry will be started over automatically; None means never.
+    retry_at: float | None = None
+    auto_retries: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         body: dict[str, Any] = {"entry_id": self.entry_id, "status": self.status}
@@ -82,6 +89,8 @@ class Summary:
             body.update(self.payload)
         if self.error:
             body["error"] = self.error
+        if self.retry_at:
+            body["retry_at"] = self.retry_at
         body["write_back"] = {
             "status": self.writeback_status,
             "attempts": self.writeback_attempts,
@@ -106,6 +115,11 @@ class Store:
         for column, statement in MIGRATIONS:
             if column not in present:
                 self._db.execute(statement)
+        if "retry_at" not in present:
+            # Failures from before automatic retrying existed get one more round.
+            self._db.execute(
+                "UPDATE summaries SET retry_at = ? WHERE status = ?", (time.time(), ERROR)
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -126,6 +140,8 @@ class Store:
             writeback_status=row["writeback_status"],
             writeback_error=row["writeback_error"],
             writeback_attempts=row["writeback_attempts"],
+            retry_at=row["retry_at"],
+            auto_retries=row["auto_retries"],
         )
 
     def get(self, entry_id: int) -> Summary | None:
@@ -154,8 +170,14 @@ class Store:
             ).fetchall()
         return {row["entry_id"]: row["status"] for row in rows}
 
-    def claim(self, entry_id: int, url: str, *, force: bool = False) -> tuple[Summary, bool]:
-        """Claim fresh work and assign it a new monotonically increasing generation."""
+    def claim(
+        self, entry_id: int, url: str, *, force: bool = False, automatic: bool = False
+    ) -> tuple[Summary, bool]:
+        """Claim fresh work and assign it a new monotonically increasing generation.
+
+        An automatic claim counts towards the entry's automatic retries; any
+        other claim is someone asking afresh, so the count starts over.
+        """
 
         now = time.time()
         with self._lock:
@@ -184,10 +206,19 @@ class Store:
                            error = NULL, model = NULL, attempts = 0,
                            generation = ?, summary_html = NULL,
                            writeback_status = ?, writeback_error = NULL,
-                           writeback_attempts = 0, updated_at = ?
+                           writeback_attempts = 0, retry_at = NULL, auto_retries = ?,
+                           updated_at = ?
                      WHERE entry_id = ?
                     """,
-                    (url, PENDING, generation, WRITEBACK_DISABLED, now, entry_id),
+                    (
+                        url,
+                        PENDING,
+                        generation,
+                        WRITEBACK_DISABLED,
+                        row["auto_retries"] + 1 if automatic else 0,
+                        now,
+                        entry_id,
+                    ),
                 )
             result = self._db.execute(
                 "SELECT * FROM summaries WHERE entry_id = ?", (entry_id,)
@@ -205,6 +236,7 @@ class Store:
         payload: dict[str, Any] | None = None,
         error: str | None = None,
         model: str | None = None,
+        retry_at: float | None = None,
     ) -> bool:
         """Conditionally finish summary work; false means the generation went stale."""
 
@@ -214,7 +246,8 @@ class Store:
             cursor = self._db.execute(
                 f"""
                 UPDATE summaries
-                   SET status = ?, source = ?, payload = ?, error = ?, model = ?, updated_at = ?
+                   SET status = ?, source = ?, payload = ?, error = ?, model = ?,
+                       retry_at = ?, updated_at = ?
                  WHERE {condition}
                 """,
                 (
@@ -223,6 +256,7 @@ class Store:
                     json.dumps(payload, ensure_ascii=False) if payload else None,
                     error,
                     model,
+                    retry_at,
                     time.time(),
                     *values,
                 ),
@@ -354,16 +388,27 @@ class Store:
             ).fetchall()
         return [(row["entry_id"], row["url"], row["generation"]) for row in rows]
 
-    def abandon_pending(self, error: str, *, keep: list[int]) -> int:
+    def abandon_pending(self, error: str, *, keep: list[int], retry_at: float | None = None) -> int:
         exclusion = f" AND entry_id NOT IN ({','.join('?' * len(keep))})" if keep else ""
         with self._lock:
             cursor = self._db.execute(
-                "UPDATE summaries SET status = ?, error = ?, updated_at = ?"
+                "UPDATE summaries SET status = ?, error = ?, retry_at = ?, updated_at = ?"
                 f" WHERE status = ?{exclusion}",
-                (ERROR, error, time.time(), PENDING, *keep),
+                (ERROR, error, retry_at, time.time(), PENDING, *keep),
             )
             self._db.commit()
         return cursor.rowcount
+
+    def due_retries(self, now: float, limit: int) -> list[tuple[int, str]]:
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT entry_id, url FROM summaries
+                 WHERE status = ? AND retry_at <= ? ORDER BY retry_at LIMIT ?
+                """,
+                (ERROR, now, limit),
+            ).fetchall()
+        return [(row["entry_id"], row["url"]) for row in rows]
 
     def original_content(self, entry_id: int) -> str | None:
         with self._lock:

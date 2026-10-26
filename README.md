@@ -20,7 +20,8 @@ sent directly to Gemini.
 - Summarizes new entries from a Miniflux webhook.
 - Adds an optional **Brief** button for older entries and manual re-runs.
 - Preserves the original entry and avoids duplicating briefs.
-- Retries temporary model and Miniflux failures safely.
+- Retries temporary model and Miniflux failures safely, and starts a failed
+  brief over automatically for about two days.
 - Keeps article fetching in a restricted container with private-network access
   blocked.
 
@@ -115,7 +116,7 @@ The button colors show the current state:
 | Grey | Not summarized yet |
 | Amber | Working or waiting to retry |
 | Green | Brief is ready |
-| Red | Brief failed; click to see the reason |
+| Red | Brief failed; click to try again now. Temporary failures also retry automatically |
 
 ## Essential configuration
 

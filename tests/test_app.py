@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import time
 from dataclasses import replace
 from unittest.mock import AsyncMock
 
@@ -13,7 +14,15 @@ import pytest_asyncio
 
 from feedsum import app as service
 from feedsum import miniflux
-from feedsum.store import READY, WRITEBACK_DISABLED, WRITEBACK_FAILED, WRITEBACK_SUCCEEDED, Store
+from feedsum.store import (
+    ERROR,
+    PENDING,
+    READY,
+    WRITEBACK_DISABLED,
+    WRITEBACK_FAILED,
+    WRITEBACK_SUCCEEDED,
+    Store,
+)
 from feedsum.summarize import Brief
 
 UI_TOKEN = "ui-token-that-is-independent-and-long"
@@ -277,3 +286,74 @@ async def test_force_invalidates_sleeping_retry_and_stale_writeback(api_state, m
         store, queue, service.WorkItem("writeback", 30, old.url, old.generation)
     )
     setter.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_transient_failures_are_started_over_until_the_rounds_run_out(api_state, monkeypatch):
+    store, queue = api_state
+    monkeypatch.setattr(
+        service, "config", replace(service.config, retry_delays=(), auto_retry_delays=(100, 200))
+    )
+    await service._enqueue(store, queue, 40, "https://example.com/40")
+
+    expected_delays = [100, 200, None]
+    for round_number, delay in enumerate(expected_delays):
+        if round_number:
+            await service._enqueue(store, queue, 40, "https://example.com/40", automatic=True)
+        item = queue.get_nowait()
+        service._fail_summary(store, queue, item, "busy", retryable=True, attempt=1)
+        failed = store.get(40)
+        assert failed.status == ERROR
+        if delay is None:
+            assert failed.retry_at is None and "retry_at" not in failed.as_dict()
+        else:
+            assert delay - 5 < failed.retry_at - time.time() <= delay
+            assert failed.as_dict()["retry_at"] == failed.retry_at
+
+    await service._enqueue(store, queue, 41, "https://example.com/41")
+    service._fail_summary(store, queue, queue.get_nowait(), "paywall", retryable=False, attempt=1)
+    assert store.get(41).retry_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweeper_starts_one_due_entry_at_a_time(api_state, monkeypatch):
+    store, queue = api_state
+    monkeypatch.setattr(service, "RETRY_SWEEP_SECONDS", 0)
+    for entry_id in (50, 51, 52):
+        store.claim(entry_id, f"https://example.com/{entry_id}")
+    store.finish(50, status=ERROR, error="busy", retry_at=1.0)
+    store.finish(51, status=ERROR, error="busy", retry_at=2.0)
+    store.finish(52, status=ERROR, error="busy", retry_at=time.time() + 3600)
+
+    sweeper = asyncio.create_task(service._retry_failed(store, queue))
+    await asyncio.sleep(0.05)
+    first = queue.get_nowait()
+    # A worker is now busy with the first: the next must wait even though the
+    # queue is empty, or it would hold up whatever that worker queues next.
+    monkeypatch.setattr(service, "_busy_workers", 1)
+    await asyncio.sleep(0.05)
+    assert queue.empty()
+    monkeypatch.setattr(service, "_busy_workers", 0)
+    await asyncio.sleep(0.05)
+    second = queue.get_nowait()
+    await asyncio.sleep(0.05)
+    sweeper.cancel()
+
+    assert (first.entry_id, second.entry_id) == (50, 51)
+    assert queue.empty()
+    assert store.get(50).status == PENDING and store.get(50).auto_retries == 1
+    assert store.get(52).status == ERROR
+
+
+@pytest.mark.asyncio
+async def test_entries_beyond_the_resume_limit_are_left_to_the_sweeper(api_state, monkeypatch):
+    store, queue = api_state
+    monkeypatch.setattr(service, "config", replace(service.config, resume_limit=1))
+    store.claim(60, "https://example.com/60")
+    store.claim(61, "https://example.com/61")
+
+    await service._resume(store, queue)
+
+    assert queue.get_nowait().entry_id == 60
+    abandoned = store.get(61)
+    assert abandoned.status == ERROR and abandoned.retry_at <= time.time()

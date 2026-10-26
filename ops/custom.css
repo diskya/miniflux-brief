@@ -23,8 +23,8 @@
     color: #fff;
 }
 
-.item-meta-icons li > .feedsum-button[disabled],
-.entry-actions li > .feedsum-button[disabled] {
+.item-meta-icons li > .feedsum-button[aria-busy="true"],
+.entry-actions li > .feedsum-button[aria-busy="true"] {
     cursor: progress;
     opacity: 0.7;
 }

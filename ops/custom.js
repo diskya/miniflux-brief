@@ -13,7 +13,10 @@ const CONFIGURED_TOKEN = "__FEEDSUM_UI_TOKEN__";
 const TOKEN_PLACEHOLDER = "__FEEDSUM_UI_TOKEN__";
 const TOKEN_STORAGE_KEY = "feedsum-ui-token";
 const POLL_MS = 4000;
-const POLL_LIMIT = 90; // ~6 minutes, enough for a long video.
+const FAST_POLLS = 90; // ~6 minutes, enough for most videos.
+// After that, keep checking slowly: a busy model can take far longer, and an
+// entry may be waiting for its next retry.
+const SLOW_POLL_MS = 30000;
 
 // The button doubles as the status light for an entry: whether a brief already
 // exists, is being generated right now, or failed.
@@ -167,19 +170,31 @@ async function loadSummary(entryId, panel) {
     body: JSON.stringify({ entry_id: entryId }),
   });
 
-  for (let attempt = 0; data.status === "pending" && attempt < POLL_LIMIT; attempt += 1) {
-    await sleep(POLL_MS);
+  for (let attempt = 0; data.status === "pending"; attempt += 1) {
+    if (attempt === FAST_POLLS) {
+      showMessage(panel, "Still working — this can take a while.", "feedsum-status");
+    }
+    await sleep(attempt < FAST_POLLS ? POLL_MS : SLOW_POLL_MS);
     data = await call(`/v1/summaries/${entryId}`, { method: "GET" });
   }
 
   if (data.status === "ready") {
     showSummary(panel, data);
-  } else if (data.status === "error") {
-    showMessage(panel, data.error || "The summary failed.", "feedsum-error");
   } else {
-    showMessage(panel, "Still working — reopen this in a moment.", "feedsum-error");
+    showMessage(panel, failureText(data), "feedsum-error");
   }
   return data.status;
+}
+
+function failureText(data) {
+  const reason = data.error || "The summary failed.";
+  if (!data.retry_at) return reason;
+  const when = new Date(data.retry_at * 1000).toLocaleString([], {
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `${reason} It will be retried automatically around ${when}.`;
 }
 
 const buttons = new Map(); // entry id -> its button, for batch status updates.
@@ -220,16 +235,15 @@ function attach(container) {
   button.addEventListener("click", async (event) => {
     event.preventDefault();
     event.stopPropagation();
-    if (running) return;
-
-    if (loaded) {
+    // While a slow brief is still being polled, a click only hides the panel.
+    if (loaded || running) {
       panel.hidden = !panel.hidden;
       return;
     }
 
     running = true;
     panel.hidden = false;
-    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
     setState(button, "pending");
     showMessage(
       panel,
@@ -245,7 +259,7 @@ function attach(container) {
       setState(button, "error");
     } finally {
       running = false;
-      button.disabled = false;
+      button.removeAttribute("aria-busy");
     }
   });
 }
@@ -273,12 +287,20 @@ async function refreshStates() {
     if (!button) continue;
     button.dataset.checked = "yes";
     const status = statuses[String(entryId)];
-    if (!status || button.dataset.state === "pending") continue;
+    if (!status || button.hasAttribute("aria-busy")) continue;
     setState(button, status);
     if (status === "ready") button.dataset.wasReady = "yes";
+    // Still being made, or waiting for a retry: look again later, so the
+    // button does not stay amber until the page is reloaded.
+    if (status === "pending") {
+      delete button.dataset.checked;
+      clearTimeout(recheck);
+      recheck = setTimeout(refreshStates, SLOW_POLL_MS);
+    }
   }
 }
 
+let recheck = null;
 let pending = null;
 function scan() {
   document

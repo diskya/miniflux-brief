@@ -6,6 +6,7 @@ import asyncio
 import hmac
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
@@ -33,6 +34,8 @@ MAX_ENTRY_ID = 2**63 - 1
 RESTART_ERROR = "Interrupted by a restart — click Brief to run it again."
 WRITEBACK_ERROR = "The brief was saved, but Miniflux write-back failed."
 UI_TOKEN_HEADER = "X-Feedsum-UI-Token"
+# How often to look for failed entries that are due another round.
+RETRY_SWEEP_SECONDS = 60
 
 PositiveEntryID = Annotated[int, Field(strict=True, gt=0, le=MAX_ENTRY_ID)]
 
@@ -86,6 +89,7 @@ class WorkItem:
 
 _retries: set[asyncio.Task] = set()
 _entry_locks: dict[int, asyncio.Lock] = {}
+_busy_workers = 0
 
 
 def _entry_lock(entry_id: int) -> asyncio.Lock:
@@ -139,8 +143,46 @@ def _fail_summary(
         )
         _schedule_retry(queue, item, delay)
         return
-    if store.finish(item.entry_id, generation=item.generation, status=ERROR, error=message):
-        logger.warning("entry %s generation %s: %s", item.entry_id, item.generation, message)
+    retry_at = _next_round(store, item.entry_id) if retryable else None
+    if store.finish(
+        item.entry_id, generation=item.generation, status=ERROR, error=message, retry_at=retry_at
+    ):
+        logger.warning(
+            "entry %s generation %s: %s%s",
+            item.entry_id,
+            item.generation,
+            message,
+            f" (starting over in {round(retry_at - time.time())}s)" if retry_at else "",
+        )
+
+
+def _next_round(store: Store, entry_id: int) -> float | None:
+    """When to start over an entry whose every attempt failed for a passing reason."""
+
+    summary = store.get(entry_id)
+    rounds = config.auto_retry_delays
+    if summary is None or summary.auto_retries >= len(rounds):
+        return None
+    return time.time() + rounds[summary.auto_retries]
+
+
+async def _retry_failed(store: Store, queue: asyncio.Queue[WorkItem]) -> None:
+    """Start over failed entries once their next round is due.
+
+    One at a time, and only while the workers are idle, so a backlog of old
+    failures never holds up a new entry or floods a provider.
+    """
+
+    while True:
+        await asyncio.sleep(RETRY_SWEEP_SECONDS)
+        if _busy_workers or not queue.empty():
+            continue
+        try:
+            for entry_id, url in store.due_retries(time.time(), limit=1):
+                logger.info("entry %s: starting a failed summary over", entry_id)
+                await _enqueue(store, queue, entry_id, url, automatic=True)
+        except Exception:
+            logger.exception("automatic retry sweep failed")
 
 
 async def _run_summary(store: Store, queue: asyncio.Queue[WorkItem], item: WorkItem) -> None:
@@ -254,21 +296,27 @@ async def _run_writeback(store: Store, queue: asyncio.Queue[WorkItem], item: Wor
 
 
 async def _worker(store: Store, queue: asyncio.Queue[WorkItem]) -> None:
+    global _busy_workers
+
     while True:
         item = await queue.get()
+        _busy_workers += 1
         try:
             if item.kind == "summary":
                 await _run_summary(store, queue, item)
             else:
                 await _run_writeback(store, queue, item)
         finally:
+            _busy_workers -= 1
             queue.task_done()
 
 
 async def _resume(store: Store, queue: asyncio.Queue[WorkItem]) -> None:
     interrupted = store.pending_entries(config.resume_limit)
     abandoned = store.abandon_pending(
-        RESTART_ERROR, keep=[entry_id for entry_id, _, _ in interrupted]
+        RESTART_ERROR,
+        keep=[entry_id for entry_id, _, _ in interrupted],
+        retry_at=time.time(),
     )
     # Write-back does not spend provider quota or rerun the model, so resume all
     # persisted writes. The summary replay cap remains the stampede protection.
@@ -296,12 +344,13 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_worker(app.state.store, app.state.queue))
         for _ in range(config.concurrency)
     ]
+    sweeper = asyncio.create_task(_retry_failed(app.state.store, app.state.queue))
     try:
         yield
     finally:
-        for task in (*app.state.workers, *_retries):
+        for task in (*app.state.workers, sweeper, *_retries):
             task.cancel()
-        await asyncio.gather(*app.state.workers, *_retries, return_exceptions=True)
+        await asyncio.gather(*app.state.workers, sweeper, *_retries, return_exceptions=True)
         _retries.clear()
         _entry_locks.clear()
         app.state.store.close()
@@ -321,9 +370,10 @@ async def _enqueue(
     url: str,
     *,
     force: bool = False,
+    automatic: bool = False,
 ) -> tuple[Summary, bool]:
     async with _entry_lock(entry_id):
-        summary, needs_work = store.claim(entry_id, url, force=force)
+        summary, needs_work = store.claim(entry_id, url, force=force, automatic=automatic)
         if needs_work:
             await queue.put(WorkItem("summary", entry_id, url, summary.generation))
     return summary, needs_work

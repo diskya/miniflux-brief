@@ -120,3 +120,53 @@ def test_completed_payload_and_writeback_state_are_persisted_for_restart(tmp_pat
     assert reopened.get(2).writeback_attempts == 1
     assert reopened.pending_writebacks(10) == [(2, "https://example.com/two", claimed.generation)]
     reopened.close()
+
+
+def test_failures_from_before_automatic_retries_are_scheduled_once(tmp_path):
+    path = tmp_path / "legacy.db"
+    db = sqlite3.connect(path)
+    db.executescript(
+        """
+        CREATE TABLE summaries (
+            entry_id INTEGER PRIMARY KEY,
+            url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source TEXT,
+            payload TEXT,
+            error TEXT,
+            model TEXT,
+            original TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        INSERT INTO summaries (entry_id, url, status, error, created_at, updated_at)
+        VALUES (1, 'https://example.com/failed', 'error', 'busy', 1.0, 1.0),
+               (2, 'https://example.com/ready', 'ready', NULL, 1.0, 1.0);
+        """
+    )
+    db.close()
+
+    store = Store(str(path))
+    assert store.get(1).retry_at is not None
+    assert store.get(2).retry_at is None
+    assert store.due_retries(store.get(1).retry_at, 10) == [(1, "https://example.com/failed")]
+    store.finish(1, status=ERROR, error="final")
+    store.close()
+
+    reopened = Store(str(path))
+    assert reopened.get(1).retry_at is None
+    reopened.close()
+
+
+def test_only_automatic_claims_count_as_automatic_retries(tmp_path):
+    store = Store(str(tmp_path / "state.db"))
+    store.claim(3, "https://example.com/three")
+    store.finish(3, status=ERROR, error="busy", retry_at=5.0)
+    retried, queued = store.claim(3, "https://example.com/three", automatic=True)
+    assert queued and retried.auto_retries == 1 and retried.retry_at is None
+
+    store.finish(3, status=ERROR, error="busy", retry_at=5.0)
+    assert store.claim(3, "https://example.com/three", automatic=True)[0].auto_retries == 2
+    store.finish(3, status=ERROR, error="busy")
+    assert store.claim(3, "https://example.com/three")[0].auto_retries == 0
+    store.close()
