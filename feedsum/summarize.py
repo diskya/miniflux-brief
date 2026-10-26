@@ -245,7 +245,9 @@ def _gemini_error(response: httpx.Response | None) -> str:
     return f"Gemini rejected the video request ({status})."
 
 
-async def _read_article(client: httpx.AsyncClient, url: str) -> tuple[str, str | None, str | None]:
+async def _read_article(
+    client: httpx.AsyncClient, url: str
+) -> tuple[str, str | None, str | None, str | None]:
     response = await client.get(
         f"{config.reader_url.rstrip('/')}/v1/read",
         params={"url": url, "json": "true"},
@@ -266,11 +268,29 @@ async def _read_article(client: httpx.AsyncClient, url: str) -> tuple[str, str |
     text = (body.get("text") or "").strip()
     if not text:
         raise SummarizeError("The article extracted to empty text.")
-    return text[: config.max_article_chars], body.get("title"), body.get("video_url")
+    return (
+        text[: config.max_article_chars],
+        body.get("title"),
+        body.get("video_url"),
+        body.get("video_host"),
+    )
+
+
+# What to show instead of an error when the page is a film we cannot watch: the
+# page's own description is still more than the feed's one-line teaser.
+UNSUPPORTED_VIDEO_EXCERPT_CHARS = 3_000
+
+
+def _unsupported_video_brief(host: str, article: str) -> str:
+    excerpt = article[:UNSUPPORTED_VIDEO_EXCERPT_CHARS].strip()
+    note = (
+        f"*Contains a video on {host}, which is not supported for parsing. The page's description:*"
+    )
+    return f"{note}\n\n{excerpt}"
 
 
 async def _summarize_article(client: httpx.AsyncClient, url: str) -> Brief:
-    article, title, video_url = await _read_article(client, url)
+    article, title, video_url, video_host = await _read_article(client, url)
 
     # A page whose own content is a video: the extracted text is only the blurb
     # and the surrounding rails, so summarizing it would describe the page
@@ -305,6 +325,15 @@ async def _summarize_article(client: httpx.AsyncClient, url: str) -> Brief:
     text = (((choices[0] if choices else {}).get("message") or {}).get("content") or "").strip()
     if not text:
         raise SummarizeError("The summarizer returned an empty response.")
+    # The model still reads the page first, since an essay may also declare a
+    # film. Only when it finds nothing but a blurb is the blurb shown as is.
+    if video_host and text.upper().startswith(UNUSABLE_PREFIX):
+        return Brief(
+            markdown=_unsupported_video_brief(video_host, article),
+            source="excerpt",
+            model=config.text_model,
+            title=title,
+        )
     return Brief(
         markdown=_validate_brief_shape(text), source="article", model=config.text_model, title=title
     )

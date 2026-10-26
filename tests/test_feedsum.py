@@ -194,6 +194,67 @@ def test_brief_shape_is_validated_before_rendering():
             _validate_brief_shape(malformed)
 
 
+class FakeArticleClient:
+    """Serves one reader response and one text-model reply."""
+
+    def __init__(self, reader_body: dict, reply: str) -> None:
+        self.reader_body = reader_body
+        self.reply = reply
+
+    async def get(self, _url, params=None, timeout=None):
+        return FakeJSONResponse(self.reader_body)
+
+    async def post(self, _url, headers=None, json=None):
+        return FakeJSONResponse({"choices": [{"message": {"content": self.reply}}]})
+
+
+class FakeJSONResponse:
+    status_code = 200
+
+    def __init__(self, body: dict) -> None:
+        self.body = body
+
+    def json(self) -> dict:
+        return self.body
+
+
+BLURB = "A filmmaker revisits her brother's fading memory in a mixed-media short."
+VALID_BRIEF = "1. One\n2. Two\n3. Three\n\n---\n\n## Good\nYes.\n\n## Gap\nNo."
+
+
+@pytest.mark.asyncio
+async def test_a_blurb_for_an_unsupported_video_is_shown_instead_of_failing():
+    client = FakeArticleClient(
+        {"text": BLURB, "title": "Spaces", "video_url": None, "video_host": "vimeo.com"},
+        "UNUSABLE: only a short blurb for a video.",
+    )
+
+    brief = await summarize._summarize_article(client, "https://psyche.co/videos/spaces")
+
+    assert brief.source == "excerpt"
+    assert "video on vimeo.com, which is not supported for parsing" in brief.markdown
+    assert brief.markdown.endswith(BLURB)
+
+
+@pytest.mark.asyncio
+async def test_an_essay_that_declares_a_video_is_still_summarized():
+    client = FakeArticleClient(
+        {"text": "A long essay.", "title": "Essay", "video_host": "vimeo.com"}, VALID_BRIEF
+    )
+
+    brief = await summarize._summarize_article(client, "https://aeon.co/essays/a")
+
+    assert (brief.source, brief.markdown) == ("article", VALID_BRIEF)
+
+
+@pytest.mark.asyncio
+async def test_a_blurb_without_an_unsupported_video_still_fails():
+    client = FakeArticleClient({"text": BLURB, "title": "Paywall"}, "UNUSABLE: a paywall.")
+
+    with pytest.raises(SummarizeError, match="No brief"):
+        await summarize._summarize_article(client, "https://example.com/a")
+
+
 def test_all_non_gemini_credentials_fail_fast():
     complete = replace(
         app_module.config,

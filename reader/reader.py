@@ -11,7 +11,7 @@ import re
 import shutil
 import socket
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import asdict, dataclass
 from functools import partial
 from typing import Any
@@ -117,6 +117,8 @@ class ArticleResult:
     tier: str
     status: int
     elapsed_ms: int
+    # Host of the page's declared main video when it is not on YouTube.
+    video_host: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -218,13 +220,8 @@ def _ld_json_nodes(data: Any):
         yield from _ld_json_nodes(data.get("@graph") or [])
 
 
-def find_primary_video(html: str) -> str | None:
-    """Return the video a page declares as its own main content, if any.
-
-    Only a schema.org ``VideoObject`` counts. A bare ``<iframe>`` is not enough:
-    an essay that merely illustrates a point with a clip would otherwise be
-    mistaken for a page whose whole content is a video.
-    """
+def _video_urls(html: str) -> Iterator[str]:
+    """Yield the URLs of every schema.org ``VideoObject`` the page declares."""
 
     for block in _LD_JSON_BLOCK.findall(html):
         try:
@@ -238,9 +235,43 @@ def find_primary_video(html: str) -> str | None:
             if "VideoObject" not in str(node_type):
                 continue
             for key in ("embedUrl", "contentUrl", "url"):
-                found = _YOUTUBE_ID.search(str(node.get(key) or ""))
-                if found:
-                    return f"https://www.youtube.com/watch?v={found.group(1)}"
+                if node.get(key):
+                    yield str(node[key])
+
+
+def find_primary_video(html: str) -> str | None:
+    """Return the video a page declares as its own main content, if any.
+
+    Only a schema.org ``VideoObject`` counts. A bare ``<iframe>`` is not enough:
+    an essay that merely illustrates a point with a clip would otherwise be
+    mistaken for a page whose whole content is a video.
+    """
+
+    for url in _video_urls(html):
+        found = _YOUTUBE_ID.search(url)
+        if found:
+            return f"https://www.youtube.com/watch?v={found.group(1)}"
+    return None
+
+
+def find_unsupported_video_host(html: str) -> str | None:
+    """Name the host of a declared main video that is not on YouTube, if any.
+
+    Such a page's text is usually only the film's blurb, and the video itself
+    cannot be watched, so the caller can say so instead of reporting a failure.
+    """
+
+    if find_primary_video(html):
+        return None
+    for url in _video_urls(html):
+        try:
+            host = (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            continue
+        for prefix in ("www.", "player."):
+            host = host.removeprefix(prefix)
+        if host:
+            return host
     return None
 
 
@@ -477,6 +508,7 @@ def _result(
     tier: str,
     started: float,
 ) -> ArticleResult:
+    html = str(getattr(page, "html_content", "") or "")
     return ArticleResult(
         url=original_url,
         final_url=str(page.url),
@@ -485,10 +517,11 @@ def _result(
         date=metadata.get("date"),
         sitename=metadata.get("sitename"),
         text=markdown,
-        video_url=find_primary_video(str(getattr(page, "html_content", "") or "")),
+        video_url=find_primary_video(html),
         tier=tier,
         status=int(page.status),
         elapsed_ms=round((time.perf_counter() - started) * 1000),
+        video_host=find_unsupported_video_host(html),
     )
 
 

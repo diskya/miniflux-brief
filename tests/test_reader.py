@@ -358,6 +358,17 @@ def test_non_youtube_and_malformed_video_metadata_are_ignored():
     assert reader.find_primary_video("<html><body>no metadata</body></html>") is None
 
 
+def test_a_non_youtube_main_video_is_named_by_its_host():
+    vimeo = ld_json('{"@type": "VideoObject", "embedUrl": "https://player.vimeo.com/video/123"}')
+    youtube = ld_json(
+        '{"@type": "VideoObject", "embedUrl": "https://www.youtube.com/embed/iNyUmbmQQZg"}'
+    )
+    assert reader.find_unsupported_video_host(vimeo) == "vimeo.com"
+    assert reader.find_unsupported_video_host(youtube) is None
+    assert reader.find_unsupported_video_host(vimeo + youtube) is None
+    assert reader.find_unsupported_video_host("<html><body>no metadata</body></html>") is None
+
+
 @pytest.mark.asyncio
 async def test_video_url_is_reported_on_the_result(monkeypatch, extraction):
     page = FakePage(
@@ -372,6 +383,7 @@ async def test_video_url_is_reported_on_the_result(monkeypatch, extraction):
 
     assert result.video_url == "https://www.youtube.com/watch?v=iNyUmbmQQZg"
     assert result.as_dict()["video_url"] == "https://www.youtube.com/watch?v=iNyUmbmQQZg"
+    assert result.video_host is None
 
 
 def test_zero_body_never_divides_or_accepts_short_extraction():
